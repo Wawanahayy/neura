@@ -1,0 +1,5 @@
+.env
+privy-session.json
+node_modules
+b.mjs
+f.mjs
