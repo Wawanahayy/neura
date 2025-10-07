@@ -5,7 +5,7 @@ git clone https://github.com/Wawanahayy/neura
 
 # install 
 ```
-npm i axios dotenv ethers yaml
+npm i axios yaml ethers https-proxy-agent socks-proxy-agent
 ```
 ## claim task
 ```
