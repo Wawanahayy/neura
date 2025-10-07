@@ -1,278 +1,246 @@
 #!/usr/bin/env node
-/**
- * faucet.mjs — AUTO FLOW (login → account → visit → claim → balances)
- *
- * Config files:
- *   - .env        : minimal creds
- *   - config.yaml : flow, log, delays/spam/backoff, networks & tokens
- *   - api.json    : endpoints & request bodies
- *
- * Run:
- *   node faucet.mjs --fresh --debug
- */
-
 import 'dotenv/config';
 import fs from 'node:fs';
 import path from 'node:path';
 import axios from 'axios';
 import { ethers } from 'ethers';
 import YAML from 'yaml';
+import { SocksProxyAgent } from 'socks-proxy-agent';
+import { HttpsProxyAgent } from 'https-proxy-agent';
+
+const REQ_VARS = ['NEURA_RPC','PRIVY_BASE','NEURAVERSE_ORIGIN','DOMAIN','CHAIN_ID_NUM','PRIVY_APP_ID','PRIVY_CA_ID'];
+for (const k of REQ_VARS) { if (!process.env[k]) { console.error(`[ENV] ${k} is required`); process.exit(1); } }
 
 const {
-  PRIVATE_KEY,
   NEURA_RPC,
   PRIVY_BASE,
   NEURAVERSE_ORIGIN,
   DOMAIN,
   CHAIN_ID_NUM,
+  PRIVY_APP_ID,
+  PRIVY_CA_ID,
   DEBUG: ENV_DEBUG,
-  SAFE_LOG_SECRETS = '0',
-
-  SEPOLIA_RPC,           
-  TOKEN_CONTRACT,        
+  SAFE_LOG_SECRETS = '1',
+  SEPOLIA_RPC,
+  TOKEN_CONTRACT,
+  PRIVATE_KEY,
+  PRIVATE_KEYS_FILE,
+  PROXIES_FILE,
+  PROXY,
+  SOCKS_PROXY,
+  HTTPS_PROXY,
 } = process.env;
 
-for (const k of ['PRIVATE_KEY','NEURA_RPC','PRIVY_BASE','NEURAVERSE_ORIGIN','DOMAIN','CHAIN_ID_NUM']) {
-  if (!process.env[k]) {
-    console.error(`[ENV] ${k} is required`);
-    process.exit(1);
-  }
-}
-
 const ARGV = new Set(process.argv.slice(2));
-const DEBUG = ENV_DEBUG === '1' || ARGV.has('--debug');
-const FRESH = ARGV.has('--fresh');
-
-const wallet = new ethers.Wallet(PRIVATE_KEY);
-const address = wallet.address;
-const CHAIN_NAMESPACE = `eip155:${CHAIN_ID_NUM}`;
+const DEBUG = ENV_DEBUG === '1' || ARGV.has('debug');
+const FRESH = ARGV.has('fresh');
 
 const ROOT = process.cwd();
-const SESSION_FILE = path.resolve(ROOT, 'privy-session.json');
 const CONFIG_YAML = path.resolve(ROOT, 'config.yaml');
 const API_JSON    = path.resolve(ROOT, 'api.json');
+if (!fs.existsSync(CONFIG_YAML)) { console.error('Missing config.yaml'); process.exit(1); }
+if (!fs.existsSync(API_JSON)) { console.error('Missing api.json'); process.exit(1); }
+const CFG = YAML.parse(fs.readFileSync(CONFIG_YAML,'utf8'));
+const API = JSON.parse(fs.readFileSync(API_JSON,'utf8'));
 
-const redact = (t, keep = 6) => {
-  if (!t || typeof t !== 'string') return t;
-  if (t.length <= keep * 2) return t;
-  return `${t.slice(0, keep)}…${t.slice(-keep)}`;
-};
-const sleep = (ms) => new Promise(r => setTimeout(r, ms));
-const rand = (min, max) => Math.floor(Math.random() * (max - min + 1)) + min;
+const HTTP_TIMEOUT   = Number(get(CFG,'net.timeoutMs', 45000));
+const NET_RETRIES    = Number(get(CFG,'net.retries', 4));
+const NET_BASE_DELAY = Number(get(CFG,'net.baseDelayMs', 900));
+const NET_BACKOFF    = Number(get(CFG,'net.backoff', 1.8));
+const NET_JITTER     = Number(get(CFG,'net.jitterMs', 350));
+const LOGIN_TRIES    = Number(get(CFG,'login.tries', 3));
 
-function isHtmlLike(s) {
-  if (!s || typeof s !== 'string') return false;
-  const t = s.trimStart();
-  return t.startsWith('<!DOCTYPE') || t.startsWith('<html') || t.includes('BAILOUT_TO_CLIENT_SIDE_RENDERING');
-}
-function previewBody(data, headers, max = 180, elideHtml = true) {
-  const ctype = (headers?.['content-type'] || '').toLowerCase();
-  if (elideHtml && (ctype.includes('text/html') || (typeof data === 'string' && isHtmlLike(data)))) {
-    const len = typeof data === 'string' ? data.length : 0;
-    return `[HTML omitted, ${len} chars]`;
-  }
-  if (data && typeof data === 'object') {
-    const pick = {};
-    if ('status' in data) pick.status = data.status;
-    if ('message' in data) pick.message = data.message;
-    if (data?.data && (typeof data.data === 'string' || typeof data.data === 'number')) pick.data = data.data;
-    if (Object.keys(pick).length) return JSON.stringify(pick);
-    try {
-      const s = JSON.stringify(data);
-      return s.length > max ? s.slice(0, max) + '…' : s;
-    } catch {}
-  }
-  if (typeof data === 'string') {
-    return data.length > max ? data.slice(0, max) + '…' : data;
-  }
-  return String(data ?? '');
-}
-function compactLine({ method, url, status, ms, data, headers, tag = '', maxBodyChars = 180, elideHtml = true }) {
-  const p = previewBody(data, headers, maxBodyChars, elideHtml);
-  const m = (method || 'REQ').toUpperCase();
+const LOG_LEVEL          = String(get(CFG,'log.level','info'));
+const LOG_MAX_BODY_CHARS = Number(get(CFG,'log.maxBodyChars',180));
+const LOG_ELIDE_HTML     = Boolean(get(CFG,'log.elideHtml',true));
+const LOG_SHOW_HEADERS   = Boolean(get(CFG,'log.showHeaders',false));
+
+const FLOW_WHOAMI   = Boolean(get(CFG,'flow.whoami', true));
+const FLOW_VISIT    = Boolean(get(CFG,'flow.visit', true));
+const VISIT_EVENT_T = String(get(CFG,'visitEvent.type','game:visitValidatorHouse'));
+const VISIT_EVENT_P = get(CFG,'visitEvent.payload', {});
+const POST_LOGIN_DELAY_MS   = Number(get(CFG,'flow.postLoginDelayMs', 0));
+const POST_SESSION_DELAY_MS = Number(get(CFG,'flow.postSessionDelayMs', 0));
+
+const CLAIM_SKIP_BELOW    = Boolean(get(CFG,'claim.skipIfBelowPoints', false));
+const CLAIM_MIN_POINTS    = Number(get(CFG,'claim.minPoints', 0));
+const CLAIM_RETRY_FOREVER = Boolean(get(CFG,'claim.retryForever', false));
+const CLAIM_ATTEMPTS      = Number(get(CFG,'claim.attempts', 25));
+const CLAIM_FACTOR        = Number(get(CFG,'claim.factor', 1.6));
+const CLAIM_JITTER        = Number(get(CFG,'claim.jitterMs', 800));
+const CLAIM_SPAM          = Number(get(CFG,'claim.spam', 1));
+const CLAIM_INTERVAL      = Number(get(CFG,'claim.intervalMs', 2500));
+const CLAIM_STOP_ON       = (get(CFG,'claim.stopOn', []) || []).map(s=>String(s||'').toLowerCase());
+
+const SESS_ROOT = path.resolve(ROOT, 'sessions');
+fs.mkdirSync(SESS_ROOT, { recursive: true });
+const accountDir  = (addr) => path.join(SESS_ROOT, addr.toLowerCase());
+const sessionFile = (addr) => path.join(accountDir(addr), 'session.json');
+function ensureAccountDir(addr){ fs.mkdirSync(accountDir(addr), { recursive: true }); }
+function deleteSessionTree(addr){ try { fs.rmSync(accountDir(addr), { recursive: true, force: true }); } catch {} }
+
+function get(obj, pathStr, def) { try { return pathStr.split('.').reduce((o,k)=> (o && k in o) ? o[k] : undefined, obj) ?? def; } catch { return def; } }
+const sleep  = (ms)=> new Promise(r=>setTimeout(r,ms));
+const redact = (t, keep=6) => (!t || typeof t!=='string' || t.length<=keep*2) ? t : `${t.slice(0,keep)}…${t.slice(-keep)}`;
+
+function compactLine({ method, url, status, ms, data, headers, tag='', maxBodyChars=180, elideHtml=true }) {
+  const previewBody = (data, headers) => {
+    const ctype = (headers?.['content-type'] || '').toLowerCase();
+    const isHtmlLike = s => !!s && typeof s==='string' && (s.trimStart().startsWith('<!DOCTYPE') || s.includes('BAILOUT_TO_CLIENT_SIDE_RENDERING'));
+    if (elideHtml && (ctype.includes('text/html') || isHtmlLike(data))) return `[HTML omitted]`;
+    if (data && typeof data === 'object') {
+      const pick = {};
+      if ('status' in data) pick.status = data.status;
+      if ('message' in data) pick.message = data.message;
+      try { const s = JSON.stringify(Object.keys(pick).length ? pick : data); return s.length>maxBodyChars ? s.slice(0,maxBodyChars)+'…' : s; } catch {}
+    }
+    if (typeof data==='string') return data.length>maxBodyChars?data.slice(0,maxBodyChars)+'…':data;
+    return String(data ?? '');
+  };
+  const m = (method||'REQ').toUpperCase();
   const s = status ? ` ${status}` : '';
-  const t = typeof ms === 'number' ? ` (${ms}ms)` : '';
-  return `${tag ? tag + ' ' : ''}${m} ${url}${s}${t} → ${p}`;
+  const t = typeof ms==='number' ? ` (${ms}ms)` : '';
+  return `${tag?tag+' ':''}${m} ${url}${s}${t} → ${previewBody(data, headers)}`;
 }
 
-const DEFAULT_CFG = {
-  flow: { whoami: true, visit: true },
-  visitEvent: { type: 'game:visitValidatorHouse', payload: {} },
-  claim: { spam: 1, intervalMs: 2500, maxAttempts: 6, baseDelayMs: 1000, maxDelayMs: 8000 },
-  events: { sendClaimEvent: true },
-  log: { level: 'info', maxBodyChars: 180, elideHtml: true, showHeaders: false },
-  balances: {
-    networks: [
-      {
-        name: 'Neura Testnet',
-        rpcEnv: 'NEURA_RPC',
-        rpc: null,
-        nativeSymbol: 'ANKR',
-        erc20: {
-          symbol: 'ANKR',
-          address: null,   
-          decimals: 18
-        }
-      }
-    ]
-  }
-};
-const DEFAULT_API = {
-  endpoints: {
-    appBase: 'https://neuraverse.neuraprotocol.io',
-    infraBase: 'https://neuraverse-testnet.infra.neuraprotocol.io',
-    claimPaths: ['/api/faucet', '/api/faucet/claim', '/api/faucet/claim-testnet', '/api/claim'],
-    eventsPath: '/api/events',
-    accountPath: '/api/account'
-  },
-  claimBodies: [{ address: '$ADDRESS' }, { recipient: '$ADDRESS' }, { to: '$ADDRESS' }, {}]
-};
-
-function loadYaml(p, fallback) {
-  try {
-    const raw = fs.readFileSync(p, 'utf8');
-    const cfg = YAML.parse(raw);
-    if (DEBUG || (fallback.log?.level || 'info') === 'debug') console.log('[dbg] loaded', path.basename(p));
-    return { ...fallback, ...cfg };
-  } catch {
-    if (DEBUG || (fallback.log?.level || 'info') === 'debug') console.log('[dbg] using default (no', path.basename(p)+')');
-    return fallback;
-  }
+function createAgentFromProxy(proxyUrl) {
+  if (!proxyUrl) return { httpAgent: undefined, httpsAgent: undefined };
+  const p = String(proxyUrl).trim().toLowerCase();
+  if (p.startsWith('socks')) { const agent = new SocksProxyAgent(proxyUrl); return { httpAgent: agent, httpsAgent: agent }; }
+  const agent = new HttpsProxyAgent(proxyUrl);
+  return { httpAgent: agent, httpsAgent: agent };
 }
-function loadJson(p, fallback) {
-  try {
-    const raw = fs.readFileSync(p, 'utf8');
-    const obj = JSON.parse(raw);
-    if (DEBUG || (fallback.log?.level || 'info') === 'debug') console.log('[dbg] loaded', path.basename(p));
-    return { ...fallback, ...obj };
-  } catch {
-    if (DEBUG || (fallback.log?.level || 'info') === 'debug') console.log('[dbg] using default (no', path.basename(p)+')');
-    return fallback;
-  }
+function maskProxyForDisplay(proxyUrl) {
+  if (!proxyUrl) return 'no-proxy';
+  try { const u = new URL(proxyUrl); return (u.protocol || '').replace(':','').toLowerCase() || 'proxy'; }
+  catch { const l = String(proxyUrl).toLowerCase(); return l.startsWith('socks') ? l.split(':')[0] : (l.startsWith('http') ? l.split(':')[0] : 'proxy'); }
 }
-const CFG = loadYaml(CONFIG_YAML, DEFAULT_CFG);
-const API = loadJson(API_JSON, DEFAULT_API);
 
-const isDebug = () => (CFG.log?.level || 'info') === 'debug' || DEBUG;
-
-const TANKR_DEFAULT = (TOKEN_CONTRACT && ethers.getAddress(TOKEN_CONTRACT))
-  || ethers.getAddress('0xB88Ca91Fef0874828e5ea830402e9089aaE0bB7F');
-
-for (const net of CFG.balances?.networks || []) {
-  if (net.rpcEnv === 'NEURA_RPC') {
-    net.rpc = NEURA_RPC;
-    if (net.erc20 && !net.erc20.address) net.erc20.address = TANKR_DEFAULT;
+function getPrivateKeys() {
+  if (PRIVATE_KEYS_FILE && fs.existsSync(PRIVATE_KEYS_FILE)) {
+    const lines = fs.readFileSync(PRIVATE_KEYS_FILE,'utf8').split(/\r?\n/).map(s=>s.trim()).filter(Boolean);
+    if (lines.length) return lines;
   }
+  if (PRIVATE_KEY) return [PRIVATE_KEY.trim()];
+  console.error('No private key found. Set PRIVATE_KEYS_FILE or PRIVATE_KEY in .env');
+  process.exit(1);
 }
-if (SEPOLIA_RPC) {
-  CFG.balances.networks.push({
-    name: 'Sepolia',
-    rpcEnv: 'SEPOLIA_RPC',
-    rpc: SEPOLIA_RPC,
-    nativeSymbol: 'ETH',
-    erc20: CFG.balances?.sepoliaToken || null, 
+function getProxies() {
+  if (PROXIES_FILE && fs.existsSync(PROXIES_FILE)) {
+    return fs.readFileSync(PROXIES_FILE,'utf8').split(/\r?\n/).map(s=>s.trim()).filter(Boolean);
+  }
+  const envSingle = PROXY || SOCKS_PROXY || HTTPS_PROXY || '';
+  return envSingle ? [envSingle] : [];
+}
+
+function axiosWithRetry({ origin, proxyUrl }) {
+  const agent = createAgentFromProxy(proxyUrl);
+  const instance = axios.create({
+    timeout: HTTP_TIMEOUT,
+    headers: {
+      accept: 'application/json',
+      'content-type': 'application/json',
+      origin,
+      referer: `${origin}/`,
+      'privy-app-id': PRIVY_APP_ID,
+      'privy-ca-id':  PRIVY_CA_ID,
+      'privy-client': 'react-auth:2.25.0',
+      'user-agent': 'Mozilla/5.0 (CLI Privy Bot)',
+    },
+    withCredentials: true,
+    httpAgent: agent.httpAgent,
+    httpsAgent: agent.httpsAgent,
+    proxy: false,
+    validateStatus: () => true,
   });
-}
 
-const { PRIVY_APP_ID, PRIVY_CA_ID } = process.env;
-for (const k of ['PRIVY_APP_ID','PRIVY_CA_ID']) {
-  if (!process.env[k]) { console.error(`[ENV] ${k} is required`); process.exit(1); }
-}
-function loadSession() {
-  if (FRESH) return {};
-  try { return JSON.parse(fs.readFileSync(SESSION_FILE, 'utf8')); }
-  catch { return {}; }
-}
-function saveSession(s) {
-  fs.writeFileSync(SESSION_FILE, JSON.stringify(s, null, 2));
-  setAuthHeadersFromSession(s);
-}
+  instance.interceptors.request.use(cfg=>{ cfg.meta = { start: Date.now() }; return cfg; });
 
-const http = axios.create({
-  timeout: 25000,
-  headers: {
-    accept: 'application/json',
-    'content-type': 'application/json',
-    origin: NEURAVERSE_ORIGIN,
-    referer: `${NEURAVERSE_ORIGIN}/`,
-    'privy-app-id': PRIVY_APP_ID,
-    'privy-ca-id': PRIVY_CA_ID,
-    'privy-client': 'react-auth:2.25.0',
-    'user-agent': 'Mozilla/5.0 (CLI Privy Bot)',
-  },
-  withCredentials: true,
-});
+  instance.interceptors.response.use(async res=>{
+    const s = res.status;
+    const retriable = s===429 || (s>=500 && s<600);
+    const cfg = res.config || {};
+    if (retriable && (cfg.__retryCount||0) < NET_RETRIES) {
+      cfg.__retryCount = (cfg.__retryCount||0) + 1;
+      const delay = Math.floor(NET_BASE_DELAY * Math.pow(NET_BACKOFF, cfg.__retryCount - 1) + Math.random()*NET_JITTER);
+      if (LOG_LEVEL !== 'silent') console.log(`network retry ${cfg.__retryCount}/${NET_RETRIES} in ${delay}ms → ${cfg.url} (status ${s})`);
+      await sleep(delay);
+      return instance(cfg);
+    }
+    return res;
+  }, async err=>{
+    const cfg = err.config || {};
+    const retriableCode = new Set(['ECONNABORTED','ECONNRESET','ETIMEDOUT','EAI_AGAIN','ECONNREFUSED','EPIPE']);
+    if ((cfg.__retryCount||0) < NET_RETRIES && (retriableCode.has(err.code) || /socket hang up/i.test(err.message||''))) {
+      cfg.__retryCount = (cfg.__retryCount||0) + 1;
+      const delay = Math.floor(NET_BASE_DELAY * Math.pow(NET_BACKOFF, cfg.__retryCount - 1) + Math.random()*NET_JITTER);
+      if (LOG_LEVEL !== 'silent') console.log(`network retry ${cfg.__retryCount}/${NET_RETRIES} in ${delay}ms → ${cfg.url} (${err.code||err.message})`);
+      await sleep(delay);
+      return instance(cfg);
+    }
+    return Promise.reject(err);
+  });
 
-http.interceptors.request.use(cfg => {
-  cfg.meta = { start: Date.now() };
-  if (isDebug()) {
-    const headers = CFG.log?.showHeaders ? cfg.headers : {
-      origin: cfg.headers?.origin,
-      'privy-app-id': cfg.headers?.['privy-app-id'],
-      authorization: cfg.headers?.authorization ? `Bearer ${redact(String(cfg.headers.authorization).slice(7))}` : undefined,
-      Cookie: cfg.headers?.Cookie ? '(set)' : undefined,
-    };
-    console.log(compactLine({
-      method: cfg.method, url: cfg.url, data: cfg.data, headers,
-      tag: '⇢', maxBodyChars: CFG.log?.maxBodyChars, elideHtml: CFG.log?.elideHtml
-    }));
+  if (DEBUG || LOG_LEVEL === 'debug') {
+    instance.interceptors.request.use(cfg=>{
+      let auth = cfg.headers?.authorization;
+      let cookie = cfg.headers?.Cookie || cfg.headers?.cookie;
+      if (SAFE_LOG_SECRETS === '1') {
+        if (auth)  auth  = `Bearer ${redact(String(auth).replace(/^Bearer\s+/i,'').trim())}`;
+        if (cookie) cookie = '(set)';
+      }
+      const headers = LOG_SHOW_HEADERS ? {
+        origin: cfg.headers?.origin,
+        'privy-app-id': cfg.headers?.['privy-app-id'],
+        authorization: auth,
+        Cookie: cookie,
+      } : undefined;
+      const proxyDisp = maskProxyForDisplay(proxyUrl);
+      console.log(compactLine({
+        method: cfg.method, url: cfg.url, data: cfg.data, headers,
+        tag:`⇢ [proxy=${proxyDisp}]`, maxBodyChars: LOG_MAX_BODY_CHARS, elideHtml: LOG_ELIDE_HTML
+      }));
+      return cfg;
+    });
+    instance.interceptors.response.use(res=>{
+      const ms = Date.now() - (res.config.meta?.start || Date.now());
+      const headers = LOG_SHOW_HEADERS ? res.headers : undefined;
+      const proxyDisp = maskProxyForDisplay(proxyUrl);
+      console.log(compactLine({
+        method: res.config.method, url: res.config.url, status: res.status, ms,
+        data: res.data, headers, tag:`⇠ [proxy=${proxyDisp}]`,
+        maxBodyChars: LOG_MAX_BODY_CHARS, elideHtml: LOG_ELIDE_HTML
+      }));
+      return res;
+    }, err=>{
+      const cfg = err.config || {};
+      const ms = Date.now() - (cfg.meta?.start || Date.now());
+      const headers = LOG_SHOW_HEADERS ? err.response?.headers : undefined;
+      const proxyDisp = maskProxyForDisplay(proxyUrl);
+      console.log(compactLine({
+        method: cfg.method, url: cfg.url, status: err.response?.status, ms,
+        data: err.response?.data, headers, tag:`⇠ [proxy=${proxyDisp}]`,
+        maxBodyChars: LOG_MAX_BODY_CHARS, elideHtml: LOG_ELIDE_HTML
+      }));
+      return Promise.reject(err);
+    });
   }
-  return cfg;
-});
 
-http.interceptors.response.use(res => {
-  const ms = Date.now() - (res.config.meta?.start || Date.now());
-  if (isDebug()) {
-    console.log(compactLine({
-      method: res.config.method, url: res.config.url, status: res.status, ms,
-      data: res.data, headers: res.headers, tag: '⇠', maxBodyChars: CFG.log?.maxBodyChars, elideHtml: CFG.log?.elideHtml
-    }));
-  }
-  return res;
-}, err => {
-  const cfg = err.config || {};
-  const ms = Date.now() - (cfg.meta?.start || Date.now());
-  if (isDebug()) {
-    console.log(compactLine({
-      method: cfg.method, url: cfg.url, status: err.response?.status, ms,
-      data: err.response?.data, headers: err.response?.headers, tag: '⇠',
-      maxBodyChars: CFG.log?.maxBodyChars, elideHtml: CFG.log?.elideHtml
-    }));
-  }
-  return Promise.reject(err);
-});
-
-function setAuthHeadersFromSession(sess) {
-  const bearer = sess?.id_token || sess?.bearer || sess?.access_token;
-  if (bearer) http.defaults.headers.common['authorization'] = `Bearer ${bearer}`;
-  else delete http.defaults.headers.common['authorization'];
-
-  const cookies = [];
-  if (sess?.id_token)      cookies.push(`privy-id-token=${sess.id_token}`);
-  if (sess?.access_token)  cookies.push(`privy-access-token=${sess.access_token}`);
-  if (sess?.privy_token)   cookies.push(`privy-token=${sess.privy_token}`);
-  if (sess?.refresh_token) cookies.push(`privy-refresh-token=${sess.refresh_token}`);
-  if (sess?.session)       cookies.push(`privy-session=${sess.session}`);
-  if (cookies.length) http.defaults.headers.common['Cookie'] = cookies.join('; ');
-  else delete http.defaults.headers.common['Cookie'];
-
-  if (isDebug()) {
-    console.log('[dbg] setAuthHeadersFromSession',
-      SAFE_LOG_SECRETS==='1'
-        ? '(redacted)'
-        : {
-            bearer: bearer ? redact(bearer) : '',
-            id_token: sess?.id_token ? redact(sess.id_token) : null,
-            access_token: sess?.access_token ? redact(sess.access_token) : null,
-            privy_token: sess?.privy_token ? redact(sess.privy_token) : null,
-            refresh_token: sess?.refresh_token ? redact(sess.refresh_token) : null,
-            session: sess?.session ? redact(sess.session) : null,
-          }
-    );
-  }
+  return instance;
 }
-setAuthHeadersFromSession(loadSession());
 
+async function withRetries(attempts, fn, label) {
+  let lastErr;
+  for (let i=0;i<attempts;i++) {
+    try { return await fn(); } catch (e) {
+      lastErr = e;
+      const delay = Math.floor(NET_BASE_DELAY * Math.pow(NET_BACKOFF, i) + Math.random()*NET_JITTER);
+      console.log(`${label} failed (${i+1}/${attempts}) → ${e.code || e.response?.status || e.message}; retrying in ${delay}ms`);
+      await sleep(delay);
+    }
+  }
+  throw lastErr;
+}
 
 function buildSiweMessage({ domain, uri, address, statement, nonce, chainId, issuedAt }) {
   return `${domain} wants you to sign in with your Ethereum account:
@@ -288,137 +256,74 @@ Issued At: ${issuedAt}
 Resources:
 - https://privy.io`;
 }
-async function siweInit(addr, { cleanHeaders = false } = {}) {
+async function siweInit(http, addr, { cleanHeaders=false } = {}) {
+  const url = `${PRIVY_BASE}/api/v1/siwe/init`;
   if (cleanHeaders) {
     const { authorization, Cookie, ...rest } = http.defaults.headers.common;
-    const tmp = axios.create({ ...http.defaults, headers: rest });
-    return (await tmp.post(`${PRIVY_BASE}/api/v1/siwe/init`, { address: addr })).data;
+    const tmp = axios.create({ ...http.defaults, headers: rest, timeout: HTTP_TIMEOUT, proxy: false, validateStatus: () => true });
+    if (http.defaults.httpsAgent) tmp.defaults.httpsAgent = http.defaults.httpsAgent;
+    if (http.defaults.httpAgent)  tmp.defaults.httpAgent  = http.defaults.httpAgent;
+    const res = await tmp.post(url, { address: addr });
+    if (res.status >= 400) throw new Error(`siwe.init status ${res.status}`);
+    return res.data;
   }
-  return (await http.post(`${PRIVY_BASE}/api/v1/siwe/init`, { address: addr })).data;
+  const res = await http.post(url, { address: addr });
+  if (res.status >= 400) throw new Error(`siwe.init status ${res.status}`);
+  return res.data;
 }
-async function siweAuthenticate({ message, signature }, { cleanHeaders = false } = {}) {
+async function siweAuthenticate(http, { message, signature }) {
+  const url = `${PRIVY_BASE}/api/v1/siwe/authenticate`;
   const payload = {
-    message,
-    signature,
-    chainId: CHAIN_NAMESPACE,
-    walletClientType: 'rabby_wallet',
-    connectorType: 'injected',
-    mode: 'login-or-sign-up',
+    message, signature,
+    chainId: `eip155:${CHAIN_ID_NUM}`,
+    walletClientType:'rabby_wallet',
+    connectorType:'injected',
+    mode:'login-or-sign-up'
   };
-  const doPost = async (strip = false) => {
+  const doPost = async (strip=false) => {
     if (strip) {
       const { authorization, Cookie, ...rest } = http.defaults.headers.common;
-      const tmp = axios.create({ ...http.defaults, headers: rest });
-      return await tmp.post(`${PRIVY_BASE}/api/v1/siwe/authenticate`, payload);
+      const tmp = axios.create({ ...http.defaults, headers: rest, timeout: HTTP_TIMEOUT, proxy: false, validateStatus: () => true });
+      if (http.defaults.httpsAgent) tmp.defaults.httpsAgent = http.defaults.httpsAgent;
+      if (http.defaults.httpAgent)  tmp.defaults.httpAgent  = http.defaults.httpAgent;
+      return await tmp.post(url, payload);
     }
-    return await http.post(`${PRIVY_BASE}/api/v1/siwe/authenticate`, payload);
+    return await http.post(url, payload);
   };
-  let res;
-  try { res = await doPost(false); }
-  catch (e) {
-    if (e.response?.status === 401 || e.response?.status === 403) {
-      console.log('↻ authenticate retry without session headers…');
-      res = await doPost(true);
-    } else throw e;
+  let res = await doPost(false);
+  if (res.status === 401 || res.status === 403) {
+    console.log('Re-auth with stripped headers');
+    res = await doPost(true);
   }
-
-  const data = res.data;
+  if (res.status >= 400) throw new Error(`siwe.authenticate status ${res.status}`);
   const setCookies = res.headers?.['set-cookie'] || [];
-  const cookieBag = {};
-  for (const sc of setCookies) {
-    const m = String(sc).match(/^([^=]+)=([^;]+)/);
-    if (!m) continue;
-    cookieBag[m[1]] = m[2];
-  }
-  return { data, cookieBag };
+  const bag = {};
+  for (const sc of setCookies) { const m = String(sc).match(/^([^=]+)=([^;]+)/); if (m) bag[m[1]] = m[2]; }
+  return { data: res.data, cookieBag: bag };
 }
 
-async function ensureLogin() {
-  const sess0 = loadSession();
-  setAuthHeadersFromSession(sess0);
+const baseApp   = get(API,'endpoints.appBase','');
+const baseInfra = get(API,'endpoints.infraBase','');
+const paths = {
+  account: get(API,'endpoints.accountPath','/api/account'),
+  events:  get(API,'endpoints.eventsPath','/api/events'),
+  faucet:  '/api/faucet',
+  leaderboards: get(API,'endpoints.leaderboardsPath','/api/leaderboards'),
+  tasks: get(API,'endpoints.tasksPath','/api/tasks'),
+  claimPaths: get(API,'endpoints.claimPaths',[]),
+};
 
-  try {
-    await apiAccount();
-    console.log('✅ session valid (already logged in)');
-    return;
-  } catch (e) {
-    if (isDebug()) console.log('[dbg] account check failed (will login):', e.response?.status, e.response?.data?.message || e.message);
-  }
+async function apiAccount(http) { const res = await http.get(`${baseInfra}${paths.account}`); if (res.status>=400) throw new Error(`api.account ${res.status}`); return res.data; }
+async function apiLeaderboards(http) { const res = await http.get(`${baseInfra}${paths.leaderboards}`); if (res.status>=400) throw new Error(`api.leaderboards ${res.status}`); return res.data; }
+async function apiTasks(http) { const res = await http.get(`${baseInfra}${paths.tasks}`); if (res.status>=400) throw new Error(`api.tasks ${res.status}`); return res.data; }
+async function postEvent(http, type, payload={}) { try { await http.post(`${baseInfra}${paths.events}`, { type, payload }); } catch {} }
 
-  console.log('🔐 login (SIWE)…');
-  let init;
-  try { init = await siweInit(address); }
-  catch (e) {
-    if (e.response?.status === 401 || e.response?.status === 403) {
-      console.log('↻ init retry without session headers…');
-      init = await siweInit(address, { cleanHeaders: true });
-    } else throw e;
-  }
-
-  const nonce = init?.nonce || ethers.hexlify(ethers.randomBytes(16)).slice(2);
-  const message = buildSiweMessage({
-    domain: DOMAIN,
-    uri: NEURAVERSE_ORIGIN,
-    address,
-    statement: 'By signing, you are proving you own this wallet and logging in. This does not initiate a transaction or cost any fees.',
-    nonce,
-    chainId: CHAIN_ID_NUM,
-    issuedAt: new Date().toISOString(),
-  });
-  if (isDebug()) {
-    console.log('[dbg] SIWE message:\n' + message.split('\n').slice(0, 10).join('\n') + '\n…');
-    console.log('[dbg] nonce =', nonce);
-  }
-  const signature = await wallet.signMessage(message);
-  if (isDebug()) console.log('[dbg] signature =', redact(signature, 10));
-
-  const { data: authData, cookieBag } = await siweAuthenticate({ message, signature });
-
-  const session = loadSession();
-  if (authData?.identity_token) session.id_token = authData.identity_token;
-  if (authData?.token)          session.privy_token = authData.token;
-  if (authData?.privy_access_token) session.access_token = authData.privy_access_token;
-  if (authData?.refresh_token && authData.refresh_token !== 'deprecated') session.refresh_token = authData.refresh_token;
-
-  if (cookieBag['privy-id-token'])      session.id_token = cookieBag['privy-id-token'];
-  if (cookieBag['privy-access-token'])  session.access_token = cookieBag['privy-access-token'];
-  if (cookieBag['privy-token'])         session.privy_token = cookieBag['privy-token'];
-  if (cookieBag['privy-refresh-token']) session.refresh_token = cookieBag['privy-refresh-token'];
-  if (cookieBag['privy-session'])       session.session = cookieBag['privy-session'];
-
-  session.bearer = session.id_token || session.access_token || session.privy_token;
-  if (!session.bearer) throw new Error('Login succeeded but identity/access token not found');
-
-  saveSession(session);
-
-  await apiAccount();
-  console.log('✅ login ok');
-}
-
-function apiBases() {
-  const { appBase, infraBase, eventsPath, accountPath } = API.endpoints;
-  return {
-    appBase, infraBase,
-    eventsURL: `${infraBase}${eventsPath}`,
-    accountURL: `${infraBase}${accountPath}`
-  };
-}
-async function apiAccount() {
-  const { accountURL } = apiBases();
-  const { data } = await http.get(accountURL);
-  return data;
-}
-
-async function sendVisitEventQuiet() {
-  const { infraBase } = API.endpoints;
-  const url = `${infraBase}${API.endpoints.eventsPath}`;
-  const type = CFG.visitEvent?.type || 'game:visitValidatorHouse';
-  const payload = CFG.visitEvent?.payload ?? {};
-  try {
-    await http.post(url, { type, payload });
-  } catch (e) {
-    if (isDebug()) console.log('[dbg] visit event error:', e.response?.status, e.response?.data || e.message);
-  }
+function accountPoints(acc){
+  if (!acc || typeof acc!=='object') return null;
+  if (typeof acc.points === 'number') return acc.points;
+  if (typeof acc.total_points === 'number') return acc.total_points;
+  if (typeof acc.score === 'number') return acc.score;
+  return null;
 }
 
 function buildBodies(to) {
@@ -428,197 +333,261 @@ function buildBodies(to) {
     return JSON.parse(s);
   });
 }
-
-async function claimAtAppFaucet(to, { maxAttempts, baseDelayMs, maxDelayMs }) {
-  const { appBase } = apiBases();
-  const url = `${appBase}/api/faucet`;
+function stopOnMatch(text){
+  if (!text) return null;
+  const s = String(text).toLowerCase();
+  for (const needle of CLAIM_STOP_ON) {
+    if (needle && s.includes(needle)) return needle;
+  }
+  return null;
+}
+async function claimAt(url, bodies, http){
+  let last;
+  for (let i=0;i<bodies.length;i++){
+    const body = bodies[i];
+    const res = await http.post(url, body);
+    const status = res.status;
+    const data = res.data;
+    const text = typeof data==='object' ? (data?.message || data?.status || JSON.stringify(data)) : (data||'');
+    const hit = stopOnMatch(text);
+    if (status < 400) {
+      if (hit) { const e = new Error(`server says stop: ${hit}`); e._stop=true; e._reason=hit; e._raw=text; e._url=url; throw e; }
+      return { url, body, data };
+    }
+    if (hit) { const e = new Error(`server says stop: ${hit}`); e._stop=true; e._reason=hit; e._raw=text; e._url=url; throw e; }
+    last = new Error(`HTTP ${status} ${text}`);
+  }
+  if (last) throw last;
+  throw new Error('all bodies failed at ' + url);
+}
+async function tryClaimOnce(to, http){
   const bodies = buildBodies(to);
-
-  let lastErr;
-  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    for (const body of bodies) {
-      try {
-        const { data } = await http.post(url, body);
-        return { url, body, data, attempt };
-      } catch (e) {
-        lastErr = e;
-        const status = e.response?.status;
-        const msg = typeof e.response?.data === 'string' ? e.response?.data : JSON.stringify(e.response?.data);
-        if (isDebug()) console.log('[dbg] claim attempt', attempt, body, '→', status, msg);
-
-        const lower = (e.response?.data?.message || msg || '').toLowerCase();
-        if (status >= 500 || lower.includes('replacement transaction underpriced')) {
-          const wait = Math.min(baseDelayMs * Math.pow(1.3, attempt - 1), maxDelayMs) + rand(0, 500);
-          if (isDebug()) console.log('[dbg] retry in', wait, 'ms');
-          await sleep(wait);
-          continue;
-        }
-        if (status && status < 500) throw e;
-      }
+  const primary = `${baseApp}${paths.faucet}`;
+  const tryUrl = async (u)=>{
+    try { return await claimAt(u, bodies, http); }
+    catch (e){
+      if (e._stop) { e.message = `STOP (${e._reason}) @ ${u} → ${e._raw}`; throw e; }
+      return null;
+    }
+  };
+  let out = await tryUrl(primary);
+  if (out) return out;
+  for (const p of paths.claimPaths){
+    out = await tryUrl(`${baseApp}${p}`); if (out) return out;
+    out = await tryUrl(`${baseInfra}${p}`); if (out) return out;
+  }
+  throw new Error('No claim endpoint succeeded');
+}
+async function claimWithPolicy(to, http){
+  const attempts = CLAIM_RETRY_FOREVER ? Number.MAX_SAFE_INTEGER : Math.max(1, CLAIM_ATTEMPTS);
+  for (let i=0;i<attempts;i++){
+    try {
+      const out = await tryClaimOnce(to, http);
+      const msg = out?.data?.message || out?.data?.status || JSON.stringify(out?.data||{});
+      console.log(`Claim: ${msg}`);
+      return out;
+    } catch (e) {
+      if (e._stop) { console.log(`Claim STOP: ${e.message}`); return { stopped: true, reason: e._reason, raw: e._raw, url: e._url }; }
+      const status = e.response?.status;
+      const body = e.response?.data;
+      const text = typeof body==='object' ? (body?.message || JSON.stringify(body)) : (body || e.message);
+      const hit = stopOnMatch(text);
+      if (hit) { console.log(`Claim STOP (matched "${hit}") → ${text}`); return { stopped: true, reason: hit, raw: text }; }
+      const delay = Math.floor(CLAIM_JITTER + Math.random()*CLAIM_JITTER + Math.pow(CLAIM_FACTOR, i));
+      console.log(`Claim failed (${i+1}/${CLAIM_RETRY_FOREVER?'∞':CLAIM_ATTEMPTS}) → ${status || ''} ${text}; retrying in ${delay}ms`);
+      await sleep(delay);
     }
   }
-  throw lastErr || new Error('claimAtAppFaucet: exhausted');
+  throw new Error('Claim attempts exhausted');
 }
 
-async function tryClaim(to, opts) {
-  const { sendClaimEvent } = CFG.events || {};
-  if (sendClaimEvent) {
-    await sendVisitEventQuiet();
-  }
-
-  try {
-    return await claimAtAppFaucet(to, opts);
-  } catch {
-    if (isDebug()) console.log('[dbg] claimAtAppFaucet failed → fallback to claimPaths');
-  }
-
-  const { appBase, infraBase } = apiBases();
-  const allBases = [appBase, infraBase];
-  const paths = API.endpoints?.claimPaths || [];
-  const bodies = buildBodies(to);
-
-  let lastErr;
-  for (const base of allBases) {
-    for (const p of paths) {
-      const url = `${base}${p}`;
-      for (const body of bodies) {
-        try {
-          const { data } = await http.post(url, body);
-          return { url, body, data, attempt: 'fallback' };
-        } catch (e) {
-          lastErr = e;
-          if (isDebug()) {
-            const s = e.response?.status;
-            const msg = typeof e.response?.data === 'string' ? e.response?.data : JSON.stringify(e.response?.data);
-            console.log('[dbg] fallback claim failed @', url, body, '→', s, msg);
-          }
-        }
-      }
-    }
-  }
-  throw lastErr || new Error('No claim endpoint succeeded');
-}
-
-const ERC20_ABI_MIN = [
-  'function balanceOf(address) view returns (uint256)',
-  'function decimals() view returns (uint8)',
-  'function symbol() view returns (string)',
-];
-
-async function getNativeBalance(rpc, addr) {
-  const provider = new ethers.JsonRpcProvider(rpc);
-  const bal = await provider.getBalance(addr);
-  return ethers.formatEther(bal);
-}
+const ERC20_ABI_MIN = ['function balanceOf(address) view returns (uint256)','function decimals() view returns (uint8)','function symbol() view returns (string)'];
+async function getNativeBalance(rpc, addr) { const provider = new ethers.JsonRpcProvider(rpc); const bal = await provider.getBalance(addr); return ethers.formatEther(bal); }
 async function getErc20Balance(rpc, tokenAddr, addr, decimalsHint) {
   const provider = new ethers.JsonRpcProvider(rpc);
   const c = new ethers.Contract(tokenAddr, ERC20_ABI_MIN, provider);
-  const [raw, decimals, symbol] = await Promise.all([
-    c.balanceOf(addr),
-    typeof decimalsHint === 'number' ? decimalsHint : c.decimals(),
-    c.symbol().catch(() => 'TOKEN'),
-  ]);
+  const [raw, decimals, symbol] = await Promise.all([ c.balanceOf(addr), typeof decimalsHint === 'number' ? decimalsHint : c.decimals(), c.symbol().catch(()=>'TOKEN') ]);
   const d = typeof decimalsHint === 'number' ? decimalsHint : decimals;
   return { symbol, decimals: d, raw: raw.toString(), formatted: ethers.formatUnits(raw, d) };
 }
 
-function explainErc20Error(chainName, tokenAddr, err) {
-  const low = (err?.message || '').toLowerCase();
-  if (err?.code === 'BAD_DATA' || low.includes('could not decode result')) {
-    return `ERC-20 balance unavailable on ${chainName}: cannot decode result. This usually means the token address ${tokenAddr} is wrong for this chain, the contract is not deployed, or it is non-standard.`;
-  }
-  if (err?.code === 'CALL_EXCEPTION') {
-    return `ERC-20 balance call reverted on ${chainName}. The contract at ${tokenAddr} may not implement ERC-20 correctly on this chain.`;
-  }
-  return `ERC-20 balance error on ${chainName}: ${err?.message || 'unknown error'}`;
-}
+async function runForAccount(pk, index, proxyForThisAccount) {
+  const wallet = new ethers.Wallet(pk);
+  const address = wallet.address;
+  const safeProxy = maskProxyForDisplay(proxyForThisAccount);
 
-async function printBalances() {
-  const nets = CFG.balances?.networks || [];
-  for (const net of nets) {
-    if (!net.rpc) continue;
-    try {
-      const native = await getNativeBalance(net.rpc, address);
-      console.log(`💰 ${net.name} native (${net.nativeSymbol}) = ${native}`);
-    } catch (e) {
-      console.log(`⚠️ ${net.name} native balance failed:`, e.message);
-    }
-    if (net.erc20?.address) {
-      const tokenAddr = ethers.getAddress(net.erc20.address);
-      try {
-        const erc = await getErc20Balance(net.rpc, tokenAddr, address, net.erc20.decimals);
-        console.log(`🪙 ${net.name} ${erc.symbol} (ERC20 @ ${tokenAddr}) = ${erc.formatted}`);
-      } catch (e) {
-        console.log(explainErc20Error(net.name, tokenAddr, e));
-      }
+  ensureAccountDir(address);
+  const SESSION_FILE = sessionFile(address);
+
+  const http = axiosWithRetry({ origin: NEURAVERSE_ORIGIN, proxyUrl: proxyForThisAccount });
+
+  function loadSession(){ if (FRESH) return {}; try { return JSON.parse(fs.readFileSync(SESSION_FILE,'utf8')); } catch { return {}; } }
+  function saveSession(s){ ensureAccountDir(address); fs.writeFileSync(SESSION_FILE, JSON.stringify(s,null,2)); setAuthHeadersFromSession(s); }
+  function setAuthHeadersFromSession(sess){
+    const bearer = sess?.id_token || sess?.bearer || sess?.access_token || sess?.privy_token;
+    if (bearer) http.defaults.headers.common['authorization'] = `Bearer ${bearer}`; else delete http.defaults.headers.common['authorization'];
+    const cookies = [];
+    if (sess?.id_token)       cookies.push(`privy-id-token=${sess.id_token}`);
+    if (sess?.access_token)   cookies.push(`privy-access-token=${sess.access_token}`);
+    if (sess?.privy_token)    cookies.push(`privy-token=${sess.privy_token}`);
+    if (sess?.refresh_token)  cookies.push(`privy-refresh-token=${sess.refresh_token}`);
+    if (sess?.session)        cookies.push(`privy-session=${sess.session}`);
+    if (cookies.length) http.defaults.headers.common['Cookie'] = cookies.join('; '); else delete http.defaults.headers.common['Cookie'];
+    if (DEBUG || LOG_LEVEL === 'debug') {
+      const show = SAFE_LOG_SECRETS==='1'
+        ? { bearer: redact(bearer||''), cookies: cookies.length ? '(set)' : '(none)' }
+        : { bearer, cookies: cookies.join('; ') || '(none)' };
+      console.log('[dbg] session.set', show);
     }
   }
-}
+  setAuthHeadersFromSession(loadSession());
 
-function printAccountSummary(acct) {
-  console.log('👤 /api/account →');
-  console.log(`  address       : ${acct?.address || '-'}`);
-  const np = Number(acct?.neuraPoints ?? 0);
-  console.log(`  neuraPoints   : ${isNaN(np) ? '-' : np}`);
-  const tvm = Number(acct?.tradingVolume?.month ?? 0);
-  const tva = Number(acct?.tradingVolume?.allTime ?? 0);
-  console.log(`  tradingVolume : month=${isNaN(tvm) ? '-' : tvm} | allTime=${isNaN(tva) ? '-' : tva}`);
-}
+  console.log(`\n== Account #${index} (${redact(address,6)}) | proxy=${safeProxy} ==`);
+  if (FLOW_WHOAMI) {
+    console.log(`Address: ${address}`);
+    console.log(`Networks: Neura Testnet${SEPOLIA_RPC ? ', Sepolia' : ''}`);
+  }
 
-(async () => {
   try {
-    console.log('Address :', address);
-    console.log(`Networks enabled: Neura Testnet${SEPOLIA_RPC ? ', Sepolia' : ''}`);
+    let acc = null;
+    let sessionValid = false;
+    try { acc = await apiAccount(http); sessionValid = true; } catch {}
+
+    if (!sessionValid || FRESH) {
+      let lastErr;
+      for (let i=0;i<LOGIN_TRIES;i++){
+        try {
+          const init = await siweInit(http, address).catch(async e=>{
+            if (e.response?.status===401 || e.response?.status===403) return await siweInit(http, address,{cleanHeaders:true});
+            throw e;
+          });
+          const nonce = init?.nonce || ethers.hexlify(ethers.randomBytes(16)).slice(2);
+          const message = buildSiweMessage({
+            domain: DOMAIN, uri: NEURAVERSE_ORIGIN, address,
+            statement: 'By signing, you are proving you own this wallet and logging in.',
+            nonce, chainId: CHAIN_ID_NUM, issuedAt: new Date().toISOString(),
+          });
+          const signature = await wallet.signMessage(message);
+          const { data: authData, cookieBag } = await siweAuthenticate(http, { message, signature });
+          const sess = {};
+          if (authData?.identity_token) sess.id_token = authData.identity_token;
+          if (authData?.privy_access_token) sess.access_token = authData.privy_access_token;
+          if (authData?.token) sess.privy_token = authData.token;
+          if (authData?.refresh_token && authData.refresh_token !== 'deprecated') sess.refresh_token = authData.refresh_token;
+          if (cookieBag['privy-id-token']) sess.id_token = cookieBag['privy-id-token'];
+          if (cookieBag['privy-access-token']) sess.access_token = cookieBag['privy-access-token'];
+          if (cookieBag['privy-token']) sess.privy_token = cookieBag['privy-token'];
+          if (cookieBag['privy-refresh-token']) sess.refresh_token = cookieBag['privy-refresh-token'];
+          if (cookieBag['privy-session']) sess.session = cookieBag['privy-session'];
+          sess.bearer = sess.id_token || sess.access_token || sess.privy_token;
+          if (!sess.bearer) throw new Error('Login ok but no token');
+          saveSession(sess);
+          acc = await apiAccount(http);
+          console.log('✅ login ok');
+          if (POST_LOGIN_DELAY_MS > 0) { console.log(`⏳ post-login delay ${POST_LOGIN_DELAY_MS}ms...`); await sleep(POST_LOGIN_DELAY_MS); }
+          break;
+        } catch (e) {
+          lastErr = e;
+          const delay = Math.floor(NET_BASE_DELAY * Math.pow(NET_BACKOFF, i) + Math.random()*NET_JITTER);
+          console.log(`Login failed (${i+1}/${LOGIN_TRIES}) → ${e.code || e.response?.status || e.message}; retrying in ${delay}ms`);
+          await sleep(delay);
+        }
+      }
+      if (!acc) throw lastErr || new Error('Login failed');
+    } else {
+      console.log('✅ session ok');
+      if (POST_SESSION_DELAY_MS > 0) { console.log(`⏳ post-session delay ${POST_SESSION_DELAY_MS}ms...`); await sleep(POST_SESSION_DELAY_MS); }
+    }
+
+    if (FLOW_VISIT) {
+      await postEvent(http, VISIT_EVENT_T, VISIT_EVENT_P);
+    }
 
     try {
-      await ensureLogin();
-    } catch (e) {
-      console.error('❌ login failed:', e.response?.status || '', e.response?.data || e.message);
-      process.exit(1);
+      const lb = await withRetries(3, async ()=> await apiLeaderboards(http), 'leaderboards');
+      console.log('\n🏆 Leaderboard (preview)');
+      let top = []; let me = null;
+      if (Array.isArray(lb?.top)) { top = lb.top; me = lb.me ?? null; }
+      else if (Array.isArray(lb)) { top = lb; }
+      else if (Array.isArray(lb?.data)) { top = lb.data; }
+      console.log('→ Your rank: not available');
+    } catch {
+      console.log('\n🏆 Leaderboard (preview)');
+      console.log('→ Your rank: not available');
     }
 
-    if (CFG.flow?.whoami) {
-      try {
-        const acct = await apiAccount();
-        printAccountSummary(acct);
-      } catch (e) {
-        console.log('⚠️ /api/account failed:', e.response?.status, e.response?.data ?? e.message);
+    let stopped = false;
+
+    if (CLAIM_SKIP_BELOW) {
+      const pts = accountPoints(acc);
+      if (pts !== null && pts < CLAIM_MIN_POINTS) {
+        console.log(`Skip claim: points ${pts} < ${CLAIM_MIN_POINTS}`);
+        stopped = true;
       }
     }
 
-    if (CFG.flow?.visit) {
-      await sendVisitEventQuiet();
+    if (!stopped) {
+      for (let s=0; s<Math.max(1,CLAIM_SPAM); s++){
+        const r = await claimWithPolicy(address, http).catch(e => ({ error: e?.message || String(e) }));
+        if (r?.stopped) { stopped = true; break; }
+        if (s < CLAIM_SPAM-1) await sleep(CLAIM_INTERVAL);
+      }
     }
 
-    const { spam, intervalMs, maxAttempts, baseDelayMs, maxDelayMs } = CFG.claim;
-    for (let i = 1; i <= Math.max(1, spam); i++) {
-      try {
-        const out = await tryClaim(address, { maxAttempts, baseDelayMs, maxDelayMs });
-        const msg = out?.data?.message || '';
-        const cd = out?.data?.data;
-        if (/already received/i.test(msg) && cd && (cd.hours!=null || cd.minutes!=null || cd.seconds!=null)) {
-          const h = cd.hours ?? 0, m = cd.minutes ?? 0, s = cd.seconds ?? 0;
-          console.log(`🎁 claim [${i}/${spam}] → already claimed. Cooldown: ${h}h ${m}m ${s}s. Stop spamming.`);
-        } else {
-          console.log(`🎁 claim [${i}/${spam}] OK`);
-          if (isDebug()) console.log('↩︎', previewBody(out.data, null, CFG.log?.maxBodyChars, CFG.log?.elideHtml));
+    try {
+      const nets = [];
+      const neura = (get(CFG,'balances.networks', []) || []).find(n => n.rpcEnv === 'NEURA_RPC');
+      if (neura) {
+        const tokenAddr = neura?.erc20?.address || TOKEN_CONTRACT || '0xB88Ca91Fef0874828e5ea830402e9089aaE0bB7F';
+        nets.push({ name: neura.name || 'Neura Testnet', rpc: NEURA_RPC, nativeSymbol: neura.nativeSymbol || 'ANKR', erc20: { address: tokenAddr, decimals: neura?.erc20?.decimals ?? 18 } });
+      }
+      if (SEPOLIA_RPC) {
+        const sp = get(CFG,'balances.sepoliaToken', null);
+        nets.push({ name: 'Sepolia', rpc: SEPOLIA_RPC, nativeSymbol: 'ETH', erc20: sp ? { address: sp.address, decimals: sp.decimals ?? 18 } : null });
+      }
+      for (const net of nets) {
+        try { const native = await getNativeBalance(net.rpc, address); console.log(`Balance ${net.name} ${net.nativeSymbol} = ${native}`); } catch (e2) { console.log(`Balance ${net.name} native failed: ${e2.message}`); }
+        if (net.erc20?.address) {
+          try { const erc = await getErc20Balance(net.rpc, ethers.getAddress(net.erc20.address), address, net.erc20.decimals); console.log(`Balance ${net.name} ${erc.symbol} = ${erc.formatted}`); }
+          catch (e3) { console.log(`Balance ${net.name} ERC20 failed: ${e3.message}`); }
         }
-      } catch (e) {
-        const status = e.response?.status;
-        const msg = typeof e.response?.data === 'string' ? e.response?.data : JSON.stringify(e.response?.data);
-        console.log(`❌ claim [${i}/${spam}] failed:`, status || '', msg || e.message);
       }
-      if (i < spam) {
-        const wait = Math.max(0, intervalMs) + rand(0, 500);
-        if (isDebug()) console.log('[dbg] wait', wait, 'ms before next claim');
-        await sleep(wait);
-      }
-    }
-
-    await printBalances();
-
+    } catch {}
   } catch (e) {
-    console.error('[fatal]', e.response?.status, e.response?.data ?? e.stack ?? e.message);
+    console.error(`[account error] ${redact(address,6)} → ${e.code || e.response?.status || e.message}`);
+  } finally {
+    deleteSessionTree(address);
+  }
+}
+
+const BETWEEN_ACCOUNTS_MS = 5000;
+let CURRENT_ADDR = null;
+
+process.on('SIGINT', () => {
+  if (CURRENT_ADDR) { deleteSessionTree(CURRENT_ADDR); console.log(`\n[abort] Session ${redact(CURRENT_ADDR,6)} cleaned (Ctrl+C)`); }
+  process.exit(130);
+});
+process.on('SIGTERM', () => {
+  if (CURRENT_ADDR) { deleteSessionTree(CURRENT_ADDR); console.log(`\n[abort] Session ${redact(CURRENT_ADDR,6)} cleaned (SIGTERM)`); }
+  process.exit(143);
+});
+
+(async ()=>{
+  try {
+    const keys = getPrivateKeys();
+    const proxies = getProxies();
+    let idx = 1;
+    for (const pk of keys) {
+      const proxy = proxies.length ? proxies[(idx-1) % proxies.length] : (PROXY || SOCKS_PROXY || HTTPS_PROXY || '');
+      const addr = (new ethers.Wallet(pk)).address;
+      CURRENT_ADDR = addr;
+      await runForAccount(pk, idx, proxy);
+      CURRENT_ADDR = null;
+      if (idx < keys.length) await sleep(BETWEEN_ACCOUNTS_MS);
+      idx++;
+    }
+  } catch (e) {
+    console.error('[fatal]', e.response?.status || '', e.response?.data ?? e.stack ?? e.message);
     process.exit(1);
   }
 })();

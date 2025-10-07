@@ -1,29 +1,58 @@
 flow:
   whoami: true
   visit: true
+  postLoginDelayMs: 100    # delay setelah "✅ login ok"
+  postSessionDelayMs: 0 
 
-# faucet
 visitEvent:
   type: game:visitValidatorHouse
   payload: {}
 
 claim:
-  spam: 1
+  skipIfBelowPoints: true
+  minPoints: 50
+
+  retryForever: false
+  attempts: 25
+  factor: 1.6
+  jitterMs: 800
+
+  spam: 20
   intervalMs: 2500
+
+  # legacy (tetap disupport)
   maxAttempts: 6
   baseDelayMs: 1000
   maxDelayMs: 8000
 
+  # semuanya lowercase biar match
+  stopOn:
+    - already received
+    - already claimed
+    - cooldown
+    - insufficient neurapoints
+    - need at least
+    - points to claim
+
 events:
   sendClaimEvent: true
 
+net:
+  timeoutMs: 45000
+  retries: 4
+  baseDelayMs: 300
+  backoff: 1.8
+  jitterMs: 200
+
+login:
+  tries: 3
+
 log:
-  level: silent            # info | debug | silent
+  level: silent         # info | debug | silent
   maxBodyChars: 180
   elideHtml: true
   showHeaders: false
 
-# Balance 
 balances:
   networks:
     - name: Neura Testnet
@@ -34,48 +63,67 @@ balances:
         symbol: WANKR
         address: "0xbd833b6ecc30caeabf81db18bb0f1e00c6997e7a"
         decimals: 18
-  # token opsional sepolia (ERC20)
   sepoliaToken:
     symbol: ANKR
     address: "0xB88Ca91Fef0874828e5ea830402e9089aaE0bB7F"
     decimals: 18
 
-#  Bridge setting 
 bridge:
   visitEvent:
     type: bridge:visit
     payload: {}
-
   token:
     symbol: ANKR
-    address: "0xB88Ca91Fef0874828e5ea830402e9089aaE0bB7F"   
+    address: "0xB88Ca91Fef0874828e5ea830402e9089aaE0bB7F"
     decimals: 18
-  spender: "0xC6255a594299f1776De376D0509AB5AB875A6E3E"    
-  amount: "1.0"            # need to bridge / amount
-  recipient: "$OWNER"      
+  spender: "0xC6255a594299f1776De376D0509AB5AB875A6E3E"
+  amount: "1.0"
+  recipient: "$OWNER"
   waitForReceipt: true
   confirmations: 1
   pollMs: 2500
 
-# SWAP Settings 
 swap:
   pools:
-    - "0xfd9741523af12334c855635e883c886214276f6d"   
-    - ""  
+    - "0xfd9741523af12334c855635e883c886214276f6d"
 
   tokenIn:
     symbol: WANKR
     address: "0xBd833b6eCC30CAEaBf81dB18BB0f1e00C6997E7a"
     decimals: 18
+
   tokenOut:
-    symbol: 
+    symbol: USDC            # <- isi sesuai token out kamu
     address: "0x9423c6c914857e6daaace3b585f4640231505128"
     decimals: 6
 
-  amountIn: "0.1"          # need to swap
-  slippageBps: 100          # 1%
-  poolFee: 500             
+  amountIn: "0.1"
+  slippageBps: 100
+  poolFee: 500
   waitForReceipt: true
   confirmations: 1
 
+game:
+  randomDelayMs: { min: 200, max: 300 }
+  perLocationRetry:
+    attempts: 2
+    baseDelayMs: 300
+    backoff: 1.0
+    jitterMs: 100
+  maxPulseSearch: 10
+  stopAfterNotFound: 7
+  treat400InvalidPulseAsNotFound: true
 
+collect:
+  mode: scan
+  attempts: 1
+  factor: 1.0
+  jitterMs: 100
+  burst:
+    count: 8
+    intervalMs: 200
+  stopOn:
+    - already received
+    - already collected
+    - cooldown
+    - invalid pulse
