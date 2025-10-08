@@ -1,13 +1,25 @@
 flow:
+  order: [game, collect, task, faucet, bridge, swap]
+  # order: [game, collect, faucet, task, bridge, swap]
+  disable: [swap,bridge]
   whoami: true
   visit: true
   postLoginDelayMs: 100    # delay setelah "✅ login ok"
   postSessionDelayMs: 0 
+  betweenAccountsMs: 5000
+log:
+  # pilih: silent | debugApi | debugAll
+  level: silent
+  socketLevel: on         # off | on | all
+  elideHtml: true
+  maxBodyChars: 180
+  showHeaders: false   # set true kalau mau lihat header di debugApi/debugAll
 
 visitEvent:
   type: game:visitValidatorHouse
   payload: {}
 
+# faucet
 claim:
   skipIfBelowPoints: true
   minPoints: 50
@@ -46,12 +58,6 @@ net:
 
 login:
   tries: 3
-
-log:
-  level: silent         # info | debug | silent
-  maxBodyChars: 180
-  elideHtml: true
-  showHeaders: false
 
 balances:
   networks:
@@ -105,6 +111,7 @@ swap:
 
 game:
   randomDelayMs: { min: 200, max: 300 }
+  retryOnECONNRESET: 3
   perLocationRetry:
     attempts: 2
     baseDelayMs: 300
@@ -116,7 +123,7 @@ game:
 
 collect:
   mode: scan
-  attempts: 1
+  attempts: 3
   factor: 1.0
   jitterMs: 100
   burst:
