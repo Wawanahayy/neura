@@ -25,12 +25,6 @@ or
 node gameplay.mjs
 ```
 
-## do you like?
-### this script open source you can DM me or create issue
-### support me
-X : https://x.com/Wawanahayy
-Tg: https://t.me/timplexz
-channel: https://t.me/AirdropJP_JawaPride
 
 
 
@@ -38,10 +32,9 @@ channel: https://t.me/AirdropJP_JawaPride
 
 
 
-
-### .env create .env use nano .env or new folder .env
-paste code this
-api key from : https://2captcha.com/
+## .env create .env use nano .env or new folder .env
+### paste code this
+### api key from : https://2captcha.com/
 
 ```
 PRIVY_BASE=https://privy.neuraprotocol.io
@@ -72,3 +65,13 @@ SIWE_AUTH_JITTER=250
 TURNSTILE_SITE_KEY=0x4AAAAAAAM8ceq5KhP1uJBt
 ROUTE=ankr2ztusd,ztusdc2ankr
 ```
+
+
+
+# do you like?
+## this script open source you can DM me or create issue
+## support me
+### X : https://x.com/Wawanahayy
+### Tg: https://t.me/timplexz
+### channel: https://t.me/AirdropJP_JawaPride
+
