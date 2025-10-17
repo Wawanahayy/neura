@@ -4,14 +4,7 @@
     "infraBase": "https://neuraverse-testnet.infra.neuraprotocol.io",
     "subgraphUrl": "https://api.goldsky.com/api/public/project_cmc8t6vh6mqlg01w19r2g15a7/subgraphs/analytics/1.0.0/gn",
     "claimPaths": [
-      "/api/faucet",
-  "/api/faucet/claim",
-  "/api/faucet/claim-testnet",
-  "/api/faucet/drip",
-  "/api/claim",
-  "/api/validator/claim",
-  "/api/testnet/faucet",
-  "/api/points/claim"
+      "/api/faucet"
     ],
     "eventsPath": "/api/events",
     "accountPath": "/api/account"

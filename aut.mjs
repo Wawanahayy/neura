@@ -26,7 +26,6 @@ function makeAgents(proxyUrl){
 }
 function requireEnv(keys){ for(const k of keys) if(!process.env[k]) throw new Error(`[ENV] ${k} is required`); }
 
-// ===== EIP-4361 (canonical/minimal, tanpa header "Sign-In with Ethereum") =====
 function buildSiweMsg({ domain, uri, address, chainId, statement }){
   return `${domain} wants you to sign in with your Ethereum account:
 ${address}
@@ -40,8 +39,7 @@ Nonce: $NONCE
 Issued At: $ISSUED_AT`;
 }
 
-// ===== Trustline token: memoized + dedupe concurrent =====
-const _trustlineCache = new Map(); // key='device-token' → { token, ts }
+const _trustlineCache = new Map(); 
 let _genInFlight = null;
 async function generateTrustlineToken(){
   const cached = _trustlineCache.get('device-token');
@@ -68,7 +66,6 @@ async function generateTrustlineToken(){
   return _genInFlight;
 }
 
-// ===== SIWE flow =====
 async function siweFlowOnce({ pk, base, proxyUrl, timeoutMs, baseHeaders }){
   const wallet = new ethers.Wallet(pk);
   const address = wallet.address;
@@ -85,10 +82,8 @@ async function siweFlowOnce({ pk, base, proxyUrl, timeoutMs, baseHeaders }){
     validateStatus: ()=>true
   });
 
-  // STEP 1: Trustline (optional, kalau index.js tersedia)
   const deviceToken = await generateTrustlineToken();
 
-  // STEP 2: /siwe/init
   const initBody = deviceToken ? { address, token: deviceToken } : { address };
   console.log('[auth-core] → /siwe/init payload:', dump(initBody));
   const r1 = await http.post('/api/v1/siwe/init', initBody);
@@ -96,7 +91,6 @@ async function siweFlowOnce({ pk, base, proxyUrl, timeoutMs, baseHeaders }){
   if(r1.status>=400) throw new Error(`siwe.init ${r1.status}`);
   const nonce = r1.data?.nonce || ethers.hexlify(ethers.randomBytes(8)).slice(2);
 
-  // STEP 3: sign message
   const message = buildSiweMsg({
     domain: process.env.DOMAIN,
     uri: process.env.NEURAVERSE_ORIGIN,

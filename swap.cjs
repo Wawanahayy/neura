@@ -1,431 +1,308 @@
 #!/usr/bin/env node
+// swap.mjs — ANKR wrap → WANKR → swap WANKR→ztUSD (atau arah lain) dengan guard KETAT arah calldata (harus kandidat A)
+
 import 'dotenv/config';
-import fs from 'node:fs';
-import path from 'node:path';
-import axios from 'axios';
-import YAML from 'yaml';
 import { ethers } from 'ethers';
 
-const {
-  PRIVATE_KEY,
-  NEURA_RPC,
-  PRIVY_BASE,
-  NEURAVERSE_ORIGIN,
-  DOMAIN,
-  PRIVY_APP_ID, PRIVY_CA_ID,
-  CHAIN_ID_NUM,
-  DEBUG: ENV_DEBUG,
-  SAFE_LOG_SECRETS = '0',
-} = process.env;
+// ---------- utils ----------
+const lc = s => String(s||'').toLowerCase();
+const strip0x = h => String(h||'').replace(/^0x/i,'');
+const with0x = h => h && !String(h).startsWith('0x') ? '0x'+h : String(h);
+const isAddr = a => /^0x[0-9a-fA-F]{40}$/.test(String(a||''));
+const z = n => '0'.repeat(n);
+const noopLog = { mini: (...a)=>console.log(...a) };
 
-for (const k of ['PRIVATE_KEY','NEURA_RPC','PRIVY_BASE','NEURAVERSE_ORIGIN','DOMAIN','CHAIN_ID_NUM']) {
-  if (!process.env[k]) { console.error(`[ENV] ${k} is required`); process.exit(1); }
+function readAddressWord(hexWord) {
+  const b = strip0x(hexWord);
+  return with0x(b.slice(24)); // last 20 bytes
 }
 
-const argv = new Map(process.argv.slice(2).map(s => {
-  const m = s.match(/^--([^=]+)(=(.*))?$/); return m ? [m[1], m[3] ?? '1'] : [s, '1'];
-}));
-const DEBUG = ENV_DEBUG === '1' || argv.has('debug');
-const FRESH = argv.has('fresh');
-const AMOUNT_OVERRIDE = argv.get('amount');              
-const ROUTE_FILTER = argv.has('route') ? Number(argv.get('route')) : null;
-
-const wallet = new ethers.Wallet(PRIVATE_KEY);
-const address = wallet.address;
-const CHAIN_NAMESPACE = `eip155:${CHAIN_ID_NUM}`;
-
-const ROOT = process.cwd();
-const SESSION_FILE = path.resolve(ROOT, 'privy-session.json');
-const CONFIG_YAML = path.resolve(ROOT, 'config.yaml');
-const API_JSON    = path.resolve(ROOT, 'api.json');
-
-const redact = (t, keep = 6) => (!t || typeof t !== 'string' || t.length <= keep*2) ? t : `${t.slice(0,keep)}…${t.slice(-keep)}`;
-const sleep = (ms) => new Promise(r => setTimeout(r, ms));
-const loadYaml = (p) => YAML.parse(fs.readFileSync(p, 'utf8'));
-const loadJson = (p) => JSON.parse(fs.readFileSync(p, 'utf8'));
-
-let CFG, API;
-try { CFG = loadYaml(CONFIG_YAML); } catch { console.error('config.yaml not found / invalid YAML'); process.exit(1); }
-try { API = loadJson(API_JSON); } catch { console.error('api.json not found / invalid JSON'); process.exit(1); }
-
-const isDebug = () => (CFG?.log?.level || 'info') === 'debug' || DEBUG;
-const dbg = (...a) => { if (isDebug()) console.log('[dbg]', ...a); };
-
-const isHtmlLike = s => !!s && typeof s === 'string' && (s.trimStart().startsWith('<!DOCTYPE') || s.includes('BAILOUT_TO_CLIENT_SIDE_RENDERING'));
-function previewBody(data, headers, max = CFG?.log?.maxBodyChars ?? 180, elideHtml = CFG?.log?.elideHtml !== false) {
-  const ctype = (headers?.['content-type'] || '').toLowerCase();
-  if (elideHtml && (ctype.includes('text/html') || isHtmlLike(data))) return `[HTML omitted]`;
-  if (data && typeof data === 'object') {
-    const pick = {};
-    if ('status' in data) pick.status = data.status;
-    if ('message' in data) pick.message = data.message;
-    try { const s = JSON.stringify(Object.keys(pick).length ? pick : data); return s.length>max ? s.slice(0,max)+'…' : s; } catch {}
+function dumpWords(data, log=noopLog){
+  const b=strip0x(data), st=b.length>=8?8:0;
+  for(let i=0;i<18 && st+i*64+64<=b.length;i++){
+    const w='0x'+b.slice(st+i*64,st+i*64+64);
+    log.mini(`[inspect] word#${i} = ${w}${/^0x0{64}$/.test(w)?' (zero)':''}`);
   }
-  if (typeof data === 'string') return data.length>max ? data.slice(0,max)+'…' : data;
-  return String(data ?? '');
-}
-const compactLine = ({ method, url, status, ms, data, headers, tag='' }) =>
-  `${tag?tag+' ':''}${(method||'REQ').toUpperCase()} ${url}${status?` ${status}`:''}${typeof ms==='number'?` (${ms}ms)`:''} → ${previewBody(data, headers)}`;
-
-const http = axios.create({
-  timeout: 25000,
-  headers: {
-    accept: 'application/json',
-    'content-type': 'application/json',
-    origin: NEURAVERSE_ORIGIN,
-    referer: `${NEURAVERSE_ORIGIN}/`,
-    'privy-app-id': PRIVY_APP_ID,
-    'privy-ca-id': PRIVY_CA_ID,
-    'privy-client': 'react-auth:2.25.0',
-    'user-agent': 'Mozilla/5.0 (CLI Privy Bot)',
-  },
-  withCredentials: true,
-});
-http.interceptors.request.use(cfg => {
-  cfg.meta = { start: Date.now() };
-  if (isDebug()) {
-    const sh = CFG.log?.showHeaders;
-    const headers = sh ? cfg.headers : {
-      origin: cfg.headers?.origin,
-      'privy-app-id': cfg.headers?.['privy-app-id'],
-      authorization: cfg.headers?.authorization ? `Bearer ${redact(String(cfg.headers.authorization).slice(7))}` : undefined,
-      Cookie: cfg.headers?.Cookie ? '(set)' : undefined,
-    };
-    console.log(compactLine({ method: cfg.method, url: cfg.url, data: cfg.data, headers, tag:'⇢' }));
-  }
-  return cfg;
-});
-http.interceptors.response.use(res => {
-  const ms = Date.now() - (res.config.meta?.start || Date.now());
-  if (isDebug()) console.log(compactLine({ method: res.config.method, url: res.config.url, status: res.status, ms, data: res.data, headers: res.headers, tag:'⇠' }));
-  return res;
-}, err => {
-  const cfg = err.config || {};
-  const ms = Date.now() - (cfg.meta?.start || Date.now());
-  if (isDebug()) console.log(compactLine({ method: cfg.method, url: cfg.url, status: err.response?.status, ms, data: err.response?.data, headers: err.response?.headers, tag:'⇠' }));
-  return Promise.reject(err);
-});
-
-function loadSession() { if (FRESH) return {}; try { return JSON.parse(fs.readFileSync(SESSION_FILE,'utf8')); } catch { return {}; } }
-function saveSession(s) { fs.writeFileSync(SESSION_FILE, JSON.stringify(s,null,2)); setAuthHeadersFromSession(s); }
-function setAuthHeadersFromSession(sess) {
-  const bearer = sess?.id_token || sess?.bearer || sess?.access_token;
-  if (bearer) http.defaults.headers.common['authorization'] = `Bearer ${bearer}`; else delete http.defaults.headers.common['authorization'];
-  const cookies = [];
-  if (sess?.id_token)      cookies.push(`privy-id-token=${sess.id_token}`);
-  if (sess?.access_token)  cookies.push(`privy-access-token=${sess.access_token}`);
-  if (sess?.privy_token)   cookies.push(`privy-token=${sess.privy_token}`);
-  if (sess?.refresh_token) cookies.push(`privy-refresh-token=${sess.refresh_token}`);
-  if (sess?.session)       cookies.push(`privy-session=${sess.session}`);
-  if (cookies.length) http.defaults.headers.common['Cookie'] = cookies.join('; '); else delete http.defaults.headers.common['Cookie'];
-  if (isDebug()) console.log('[dbg] setAuthHeadersFromSession', SAFE_LOG_SECRETS==='1' ? '(redacted)' : { bearer: bearer?redact(bearer):'' });
-}
-setAuthHeadersFromSession(loadSession());
-
-function buildSiweMessage({ domain, uri, address, statement, nonce, chainId, issuedAt }) {
-  return `${domain} wants you to sign in with your Ethereum account:
-${address}
-
-${statement}
-
-URI: ${uri}
-Version: 1
-Chain ID: ${chainId}
-Nonce: ${nonce}
-Issued At: ${issuedAt}
-Resources:
-- https://privy.io`;
-}
-async function siweInit(addr) { return (await http.post(`${PRIVY_BASE}/api/v1/siwe/init`, { address: addr })).data; }
-async function siweAuthenticate({ message, signature }) {
-  const payload = { message, signature, chainId: CHAIN_NAMESPACE, walletClientType:'rabby_wallet', connectorType:'injected', mode:'login-or-sign-up' };
-  const res = await http.post(`${PRIVY_BASE}/api/v1/siwe/authenticate`, payload);
-  const data = res.data, setCookies = res.headers?.['set-cookie'] || [], bag = {};
-  for (const sc of setCookies) { const m = String(sc).match(/^([^=]+)=([^;]+)/); if (m) bag[m[1]] = m[2]; }
-  return { data, cookieBag: bag };
-}
-async function ensureLogin() {
-  try { await apiAccount(); console.log('✅ already logged in (session valid)'); return; }
-  catch {}
-  const init = await siweInit(address);
-  const nonce = init?.nonce || ethers.hexlify(ethers.randomBytes(16)).slice(2);
-  const message = buildSiweMessage({ domain: DOMAIN, uri: NEURAVERSE_ORIGIN, address,
-    statement:'By signing, you are proving you own this wallet and logging in. This does not initiate a transaction or cost any fees.',
-    nonce, chainId: CHAIN_ID_NUM, issuedAt: new Date().toISOString() });
-  const signature = await wallet.signMessage(message);
-  const { data: authData, cookieBag } = await siweAuthenticate({ message, signature });
-  const session = loadSession();
-  if (authData?.identity_token) session.id_token = authData.identity_token;
-  if (authData?.privy_access_token) session.access_token = authData.privy_access_token;
-  if (authData?.token) session.privy_token = authData.token;
-  if (cookieBag['privy-id-token'])      session.id_token = cookieBag['privy-id-token'];
-  if (cookieBag['privy-access-token'])  session.access_token = cookieBag['privy-access-token'];
-  if (cookieBag['privy-token'])         session.privy_token = cookieBag['privy-token'];
-  if (cookieBag['privy-session'])       session.session = cookieBag['privy-session'];
-  session.bearer = session.id_token || session.access_token || session.privy_token;
-  if (!session.bearer) throw new Error('Login succeeded but no identity/access token found');
-  saveSession(session);
-  await apiAccount();
-  console.log('✅ login ok');
 }
 
-function apiBases() {
-  const ep = API.endpoints || {};
-  return {
-    eventsURL: `${ep.infraBase}${ep.eventsPath}`,
-    accountURL: `${ep.infraBase}${ep.accountPath}`,
-    subgraphUrl: ep.subgraphUrl
-  };
-}
-async function apiAccount() {
-  const { accountURL } = apiBases();
-  const { data } = await http.get(accountURL);
-  return data;
-}
-async function postVisitQuiet(type = 'swap:visit', payload = {}) {
-  const { eventsURL } = apiBases();
-  try { await http.post(eventsURL, { type, payload }); } catch {}
-}
-async function fetchPools(poolIds) {
-  const { subgraphUrl } = apiBases();
-  if (!subgraphUrl) throw new Error('Missing endpoints.subgraphUrl in api.json');
-  const query = `
-    query MultiplePools($poolIds: [ID!]) {
-      pools(where: {id_in: $poolIds}) {
-        id fee
-        token0 { id symbol name decimals derivedMatic }
-        token1 { id symbol name decimals derivedMatic }
-        sqrtPrice liquidity tick tickSpacing
-        totalValueLockedUSD volumeUSD feesUSD untrackedFeesUSD
-        token0Price token1Price
+function applyPatches({ dataHex, patches=[], owner, log=noopLog }){
+  let body = strip0x(dataHex);
+  dumpWords('0x'+body, log);
+  for(const p of patches){
+    const mode = String(p.mode||'').toLowerCase();
+    if(mode==='findexact'){
+      const old=String(p.old||''), to=String(p.to||'$OWNER');
+      const toAddr = to==='$OWNER'? owner : to;
+      if(isAddr(old)&&isAddr(toAddr)){
+        const find = z(24)+strip0x(old).padStart(40,'0');
+        const rep  = z(24)+strip0x(toAddr).padStart(40,'0');
+        const re = new RegExp(find,'gi');
+        const cnt = (body.match(re)||[]).length;
+        if(cnt){ body = body.replace(re, rep); log.mini(`[swap] patch(findExact) ${old} → ${toAddr} (${cnt}x)`); }
       }
-    }`;
-  const { data } = await axios.post(subgraphUrl, {
-    operationName: 'MultiplePools',
-    variables: { poolIds },
-    query
-  }, { headers: { 'content-type': 'application/json', accept: '*/*', origin: NEURAVERSE_ORIGIN, referer: `${NEURAVERSE_ORIGIN}/` } });
-  return data?.data?.pools || [];
-}
-
-const POW10 = (n) => 10n ** BigInt(n);
-function toScaled18(s) {
-  const t = String(s).trim();
-  if (!t.includes('.')) return BigInt(t) * POW10(18);
-  const [i, fRaw] = t.split('.');
-  const f = fRaw.slice(0,18);
-  const pad = 18 - f.length;
-  const intScaled = BigInt(i || '0') * POW10(18);
-  const fracScaled = BigInt(f || '0') * POW10(pad);
-  return t.startsWith('-') ? -(intScaled + fracScaled) : (intScaled + fracScaled);
-}
-function estimateOut(amountInWei, tokenIn, tokenOut, pool) {
-  const t0 = ethers.getAddress(pool.token0.id), t1 = ethers.getAddress(pool.token1.id);
-  const a  = ethers.getAddress(tokenIn.address), b  = ethers.getAddress(tokenOut.address);
-  const decIn = BigInt(tokenIn.decimals), decOut = BigInt(tokenOut.decimals);
-  const scale = POW10(18);
-  let pScaled;
-  if (a === t0 && b === t1)      pScaled = toScaled18(pool.token0Price);
-  else if (a === t1 && b === t0) pScaled = toScaled18(pool.token1Price);
-  else return 0n;
-  const diff = decOut - decIn;
-  if (diff >= 0n) return (amountInWei * pScaled * POW10(Number(diff))) / scale;
-  return (amountInWei * pScaled) / (scale * POW10(Number(-diff)));
-}
-const applySlippage = (out, bps) => out - (out * BigInt(bps) / 10000n);
-const fmt = (n, d) => ethers.formatUnits(n, d);
-const toBig = (n, d) => ethers.parseUnits(String(n), d);
-
-const ERC20_ABI = [
-  'function symbol() view returns (string)',
-  'function decimals() view returns (uint8)',
-  'function balanceOf(address) view returns (uint256)',
-  'function allowance(address owner, address spender) view returns (uint256)',
-  'function approve(address spender, uint256 value) returns (bool)',
-];
-async function getErc20Balance(provider, token, owner) {
-  const c = new ethers.Contract(token.address, ERC20_ABI, provider);
-  return await c.balanceOf(owner);
-}
-async function ensureAllowance(provider, tokenAddr, owner, spender, wantAmount, decimals) {
-  const signer = new ethers.Wallet(PRIVATE_KEY, provider);
-  const erc20  = new ethers.Contract(tokenAddr, ERC20_ABI, signer);
-  const [allow, sym] = await Promise.all([ erc20.allowance(owner, spender), erc20.symbol().catch(()=> 'TOKEN') ]);
-  console.log('🔗 Approve (if needed)');
-  console.log(`  Token     : ${sym} @ ${tokenAddr}`);
-  console.log(`  Spender   : ${spender}`);
-  console.log(`  Owner     : ${owner}`);
-  console.log(`  AmountIn  : ${fmt(wantAmount, decimals)} (${wantAmount.toString()})`);
-  console.log(`  Allowance : ${fmt(allow, decimals)} ${sym}`);
-  if (allow >= wantAmount) { console.log('✅ enough allowance; skip approve'); return; }
-  const tx = await erc20.approve(spender, wantAmount);
-  console.log(`📝 approve tx: ${tx.hash}`);
-  const confs = Math.max(0, Number(CFG.swap?.confirmations ?? 1));
-  if (CFG.swap?.waitForReceipt ?? true) {
-    const r = await tx.wait(confs);
-    console.log(r?.status === 1 ? `🎉 approve confirmed (block ${r.blockNumber})` : `⚠️ approve mined with status ${r?.status}`);
+    } else if(mode==='auto'){
+      const to=String(p.to||'$OWNER'); const toAddr=to==='$OWNER'?owner:to;
+      if(!isAddr(toAddr)) continue;
+      const idx=Number(p.index ?? p.word ?? p.wordIndex);
+      const st=body.length>=8?8:0;
+      const putAt=(wi)=>{ const pre=body.slice(0,st+wi*64), post=body.slice(st+wi*64+64);
+        log.mini(`[swap] recipientPatch(auto) @word=${wi} 0x${body.slice(st+wi*64+24,st+wi*64+64)} → ${toAddr}`);
+        body=pre+(z(24)+strip0x(toAddr).padStart(40,'0'))+post; };
+      if(Number.isFinite(idx)&&idx>=0) putAt(idx);
+      else{
+        const total=Math.floor((body.length-st)/64);
+        for(let wi=total-1; wi>=0; wi--){ if(body.slice(st+wi*64,st+wi*64+64)===z(64)){ putAt(wi); break; } }
+      }
+    }
   }
+  return with0x(body);
 }
 
-function tryChecksum(addr) {
-  try { return ethers.getAddress(addr); }
-  catch { const low = String(addr||'').toLowerCase(); if (/^0x[0-9a-f]{40}$/.test(low)) return ethers.getAddress(low); throw new Error('bad address checksum'); }
+// --- Decoder 0x1679c792 (exactInputSingle-like; alamat ada di word0 & word1; payer di word3) ---
+function parse1679(data){
+  const b=strip0x(data);
+  const w=i=>'0x'+b.slice(8+i*64,8+(i+1)*64);
+  const addr=wd=>with0x(wd.slice(-40));
+  const A={ tokenIn:addr(w(0)), tokenOut:addr(w(1)), payer:addr(w(3)), amountIn: undefined };
+  const B={ tokenIn:addr(w(1)), tokenOut:addr(w(0)), payer:addr(w(3)), amountIn: undefined };
+  const slots=[5,9,10,11]; // lokasi lazim amountIn di berbagai aggregator
+  for(const i of slots){
+    try{ const v=ethers.toBigInt(w(i)); if(v>0n){ if(!A.amountIn) A.amountIn=v; if(!B.amountIn) B.amountIn=v; } }catch{}
+  }
+  return {A,B};
 }
-function materializeArgs(args, vars) {
-  if (!Array.isArray(args)) return args;
-  return args.map(v => {
-    if (typeof v !== 'string') return v;
-    return ({
-      '$TOKEN_IN': vars.TOKEN_IN, '$TOKEN_OUT': vars.TOKEN_OUT,
-      '$AMOUNT_IN': vars.AMOUNT_IN, '$MIN_OUT': vars.MIN_OUT,
-      '$RECIPIENT': vars.RECIPIENT, '$POOL_FEE': vars.POOL_FEE,
-      '$DEADLINE': vars.DEADLINE
-    }[v]) ?? v;
-  });
+
+// ---------- ABIs ----------
+const ERC20_ABI=[
+  'function allowance(address owner,address spender) view returns (uint256)',
+  'function approve(address spender,uint256 amount) returns (bool)',
+  'function balanceOf(address) view returns (uint256)',
+  'function decimals() view returns (uint8)',
+  'function symbol() view returns (string)',
+];
+const WETH_LIKE_ABI=[
+  'function deposit() payable',
+  'function balanceOf(address) view returns (uint256)',
+];
+
+// ---------- core helpers ----------
+async function ensureAllowance({provider, wallet, token, owner, spender, wantAmount, log=noopLog}){
+  const c = new ethers.Contract(token, ERC20_ABI, provider);
+  // meta (best effort)
+  let sym='???', dec=18;
+  try { dec = await c.decimals(); } catch {}
+  try { sym = await c.symbol(); } catch {}
+
+  const [bal, cur] = await Promise.all([
+    c.balanceOf(owner),
+    c.allowance(owner, spender),
+  ]);
+
+  log.mini(`[preflight] tokenIn=${token} (${sym}/${dec}) | balance=${bal} | allowance(${spender})=${cur} | need≈${wantAmount}`);
+
+  if(cur >= wantAmount){ log.mini(`[approve] allowance OK (>= need)`); return; }
+
+  // Some tokens require zeroing first
+  const cW = c.connect(wallet);
+  try{
+    const tx1 = await cW.approve(spender, 0);
+    log.mini(`[approve] reset→0: ${tx1.hash}`);
+    await tx1.wait(1);
+  }catch(e){
+    log.mini(`[approve] reset→0 skipped: ${e?.shortMessage||e?.message||e}`);
+  }
+
+  const tx2 = await cW.approve(spender, ethers.MaxUint256);
+  log.mini(`[approve] set→MAX: ${tx2.hash}`);
+  await tx2.wait(1);
+  const after = await c.allowance(owner, spender);
+  log.mini(`[approve] post-allowance=${after}`);
 }
-async function doRouterSwap(provider, route, quote) {
-  const txCfg = route?.tx || CFG.swap?.tx;
-  if (!txCfg?.to || !txCfg?.abi || !txCfg?.method) {
-    console.log('ℹ️ No router configured (swap.tx missing). Dry-run only (no onchain swap).');
+
+async function buildGasOverrides(provider, add=0){
+  const fee=await provider.getFeeData();
+  const bump=v=>v?(v+v*BigInt(Math.floor(add))/100n):v;
+  if(fee.maxFeePerGas && fee.maxPriorityFeePerGas) return {type:2,maxFeePerGas:bump(fee.maxFeePerGas),maxPriorityFeePerGas:bump(fee.maxPriorityFeePerGas)};
+  return {type:0, gasPrice:bump(fee.gasPrice ?? 1_000_000_000n)};
+}
+
+async function doWrapIfNeeded({ provider, wallet, owner, SW, log=noopLog }) {
+  if (!String(SW.wrapFirst).match(/true/i)) return;
+
+  const wtoken = SW.wtoken;
+  const value = BigInt(SW.value || '0');
+
+  if (!isAddr(wtoken)) { log.mini('[wrap] skip: wtoken invalid'); return; }
+  if (value <= 0n)     { log.mini('[wrap] skip: value=0'); return; }
+
+  const w = new ethers.Contract(wtoken, WETH_LIKE_ABI, provider).connect(wallet);
+  const before = await w.balanceOf(owner);
+  log.mini(`[wrap] deposit ${value} (ANKR) -> WANKR @ ${wtoken}`);
+  const tx = await w.deposit({ value });
+  log.mini(`[wrap] tx: ${tx.hash}`);
+  const rc = await tx.wait(1);
+  const after = await w.balanceOf(owner);
+  log.mini(`[wrap] ✅ confirmed in block ${rc.blockNumber} | WANKR balance: ${before} -> ${after}`);
+}
+
+// ---------- main ----------
+export async function run(ctx){
+  const { address: owner, wallet, env={}, config={}, log=noopLog } = ctx;
+
+  const SW = config.swap || {};
+  const ROUTER = String(SW.router||'').trim();
+  if(!isAddr(ROUTER)){ log.mini('[swap] skip: router missing/invalid'); return; }
+
+  // RPC
+  const RPC = env.NEURA_RPC || env.RPC_URL || 'https://testnet.rpc.neuraprotocol.io';
+  const provider = new ethers.JsonRpcProvider(RPC);
+  const signer = wallet.connect(provider);
+
+  // raw calldata + expected direction
+  const raw = String(SW.calldata||'').trim();
+  if(!/^0x[0-9a-fA-F]{8,}$/.test(raw)){ log.mini('[swap] skip: calldata kosong/tidak valid'); return; }
+
+  const WANT_IN  = String(SW.tokenIn||'').trim();
+  const WANT_OUT = String(SW.tokenOut||'').trim();
+  if(!isAddr(WANT_IN)||!isAddr(WANT_OUT)){ log.mini('[swap] config tokenIn/tokenOut wajib diisi'); return; }
+
+  // 0) Wrap (ANKR → WANKR) jika diminta
+  await doWrapIfNeeded({ provider, wallet: signer, owner, SW, log });
+
+  // 1) Apply patches
+  const data = applyPatches({ dataHex: raw, patches: Array.isArray(SW.patches)?SW.patches:[], owner, log });
+
+  // 2) Ambil subcall pertama jika multicall
+  let sub = data;
+  if (strip0x(data).slice(0,8).toLowerCase()==='ac9650d8'){
+    const iface=new ethers.Interface(['function multicall(bytes[] data)']);
+    const arr=iface.decodeFunctionData('multicall',data).data||[];
+    if(!arr.length){ log.mini('[mc] kosong'); return; }
+    sub=with0x(strip0x(arr[0]));
+  }
+
+  // 3) Validasi selector
+  if (strip0x(sub).slice(0,8).toLowerCase()!=='1679c792'){
+    log.mini('[swap] bukan selector 0x1679c792. Saat ini skrip hanya memvalidasi pola itu.');
     return;
   }
-  const to = tryChecksum(txCfg.to);
-  const iface = new ethers.Interface(txCfg.abi);
-  const recipient = (route?.recipient || CFG.swap?.recipient || '$OWNER') === '$OWNER' ? address : (route?.recipient || CFG.swap?.recipient);
-  const deadline = Math.floor(Date.now()/1000) + 60 * 10;
 
-  const vars = {
-    TOKEN_IN:  tryChecksum(route.tokenIn.address),
-    TOKEN_OUT: tryChecksum(route.tokenOut.address),
-    AMOUNT_IN: quote.amountIn,
-    MIN_OUT:   quote.minOut,
-    RECIPIENT: recipient,
-    POOL_FEE:  Number(route.poolFee ?? CFG.swap?.poolFee ?? 500),
-    DEADLINE:  BigInt(deadline),
-  };
-  const args = materializeArgs(txCfg.args, vars);
-  const data = iface.encodeFunctionData(txCfg.method, args);
-  const value = txCfg.value ? ethers.parseEther(String(txCfg.value)) : 0n;
+  // 4) Parse kandidat arah
+  const {A,B}=parse1679(sub);
+  log.mini(`[mc] A: tokenIn=${A.tokenIn} tokenOut=${A.tokenOut} payer=${A.payer} amountIn=${A.amountIn??'(?)'}`);
+  log.mini(`[mc] B: tokenIn=${B.tokenIn} tokenOut=${B.tokenOut} payer=${B.payer} amountIn=${B.amountIn??'(?)'}`);
 
-  await ensureAllowance(provider, vars.TOKEN_IN, address, to, quote.amountIn, route.tokenIn.decimals);
+  // 5) PILIH A SAJA (harus cocok arah di calldata). Jika tidak, stop (fail-fast).
+  let pick=null;
+  if(lc(A.tokenIn)===lc(WANT_IN) && lc(A.tokenOut)===lc(WANT_OUT)) {
+    pick = A;
+  } else {
+    log.mini(`[guard] ❌ Calldata encode arah berbeda!
+  Expect A: ${WANT_IN} → ${WANT_OUT}
+  Got    A: ${A.tokenIn} → ${A.tokenOut}
+  Hint: ambil ulang quote dari dApp untuk arah yang benar, lalu paste ke config.calldata.`);
+    return;
+  }
+  log.mini(`[pick] tokenIn=${pick.tokenIn} tokenOut=${pick.tokenOut} payer=${pick.payer} amountIn=${pick.amountIn ?? '(?)'}`);
 
-  const signer = new ethers.Wallet(PRIVATE_KEY, provider);
-  const tx = await signer.sendTransaction({ to, data, value });
-  console.log(`📝 swap tx: ${tx.hash}`);
-  const confs = Math.max(0, Number(route.confirmations ?? CFG.swap?.confirmations ?? 1));
-  if ((route.waitForReceipt ?? CFG.swap?.waitForReceipt) ?? true) {
-    const r = await tx.wait(confs);
-    console.log(r?.status === 1 ? `🎉 swap confirmed (block ${r.blockNumber})` : `⚠️ swap mined with status ${r?.status}`);
+  // 6) Payer harus owner
+  if(isAddr(pick.payer) && lc(pick.payer)!==lc(owner)){
+    log.mini(`[guard] ❌ payer=${pick.payer} ≠ owner ${owner}. Stop.`); return;
+  }
+
+  // 7) Cek saldo tokenIn (fail-fast)
+  try{
+    const erc20=new ethers.Contract(pick.tokenIn,ERC20_ABI,provider);
+    const bal=await erc20.balanceOf(owner);
+    if(bal===0n){ log.mini(`[guard] ❌ saldo tokenIn=0 (${pick.tokenIn}). Tidak kirim tx.`); return; }
+  }catch{}
+
+  // 8) Approve tokenIn → router (dengan reset→0 lalu MAX)
+  const need = pick.amountIn && pick.amountIn>0n ? pick.amountIn : (ethers.MaxUint256/4n);
+  await ensureAllowance({provider, wallet: signer, token: pick.tokenIn, owner, spender: ROUTER, wantAmount: need, log});
+
+  // 9) Simulasi & estimateGas (decode STF bila gagal)
+  const net=await provider.getNetwork();
+  log.mini(`\n[rpc] ${RPC} | chainId=${Number(net.chainId)}`);
+  log.mini(`[swap] router=${ROUTER}`); log.mini(`[acct] ${owner}`);
+
+  try {
+    // gunakan DATA penuh (multicall atau single) karena itu yang akan dieksekusi
+    await provider.call({ from: owner, to: ROUTER, data, value: 0n });
+  } catch (e) {
+    const msg = e?.shortMessage || e?.reason || e?.error?.message || e?.message || String(e);
+    log.mini(`[swap] ❌ simulate revert: ${msg}`);
+    if (/STF|TRANSFER_FROM_FAILED/i.test(msg)) {
+      log.mini(`[hint] "STF" = TransferHelper: TRANSFER_FROM_FAILED → cek:`);
+      log.mini(`[hint] 1) Balance tokenIn; 2) Allowance(${ROUTER}); 3) payer==owner; 4) token butuh approve(0) dulu (sudah kita handle).`);
+    }
+    return;
+  }
+
+  let gasLimit;
+  try{
+    gasLimit=await provider.estimateGas({ from: owner, to: ROUTER, data, value: 0n });
+    log.mini(`[swap] simulate OK, estimateGas=${gasLimit}`);
+  }catch(e){
+    const msg = e?.shortMessage || e?.reason || e?.error?.message || e?.message || String(e);
+    log.mini(`[swap] ⚠️ estimateGas gagal: ${msg}`);
+    return;
+  }
+
+  // 10) Send tx
+  const gasOv=await buildGasOverrides(provider, Number(config?.swap?.gas?.addPercent??0));
+  const tx=await signer.sendTransaction({to:ROUTER,data,value:0n,gasLimit,...gasOv});
+  log.mini(`[swap] tx: ${tx.hash}`);
+  if(config?.swap?.waitForReceipt!==false){
+    const rc=await tx.wait(Number(config?.swap?.confirmations??1)||1);
+    log.mini(`[swap] ✅ confirmed in block ${rc.blockNumber}`);
   }
 }
 
-(async () => {
-  try {
-    console.log('Address :', address);
+export default { run };
 
-    await ensureLogin();
-
-    if (CFG.flow?.whoami) {
-      try {
-        const acct = await apiAccount();
-        console.log('👤 /api/account →');
-        console.log(`  address       : ${acct?.address || '-'}`);
-        console.log(`  neuraPoints   : ${Number(acct?.neuraPoints ?? 0)}`);
-        console.log(`  tradingVolume : month=${Number(acct?.tradingVolume?.month ?? 0)} | allTime=${Number(acct?.tradingVolume?.allTime ?? 0)}`);
-      } catch (e) {
-        console.log('⚠️ /api/account failed:', e.response?.status || '', e.response?.data?.message || e.message);
-      }
+// ---------- Optional: CLI quick runner ----------
+// Jalankan: OWNER_PK=0x... node swap.mjs
+if (import.meta.url === `file://${process.argv[1]}`) {
+  (async () => {
+    const OWNER_PK = process.env.OWNER_PK || process.env.PRIVATE_KEY;
+    if (!OWNER_PK) {
+      console.error('Env OWNER_PK/PRIVATE_KEY kosong.');
+      process.exit(1);
     }
+    const wallet = new ethers.Wallet(OWNER_PK);
+    const owner = await wallet.getAddress();
 
-    if (CFG.flow?.visit) {
-      const ev = CFG.visitEvent || { type: 'swap:visit', payload: {} };
-      await postVisitQuiet(ev.type || 'swap:visit', ev.payload ?? {});
-    }
-
-    const SW = CFG.swap || {};
-    let routes = Array.isArray(SW.routes) && SW.routes.length ? SW.routes : [{
-      pools: SW.pools || [],
-      tokenIn: SW.tokenIn, tokenOut: SW.tokenOut,
-      amountIn: SW.amountIn, slippageBps: SW.slippageBps,
-      waitForReceipt: SW.waitForReceipt, confirmations: SW.confirmations,
-      enforceBalance: SW.enforceBalance, poolFee: SW.poolFee, tx: SW.tx, recipient: SW.recipient,
-    }];
-
-    if (ROUTE_FILTER !== null) {
-      if (ROUTE_FILTER < 0 || ROUTE_FILTER >= routes.length) { console.error(`Invalid --route index ${ROUTE_FILTER}`); process.exit(1); }
-      routes = [routes[ROUTE_FILTER]];
-    }
-
-    const provider = new ethers.JsonRpcProvider(NEURA_RPC);
-    const delayMs = Math.max(0, Number(SW.delayMs ?? 3000));
-
-    for (let i = 0; i < routes.length; i++) {
-      const r = routes[i];
-
-      const amountHuman = AMOUNT_OVERRIDE ?? r.amountIn ?? SW.amountIn ?? '0';
-      const amountIn = ethers.parseUnits(String(amountHuman), r.tokenIn.decimals);
-
-      const poolIds = Array.isArray(r.pools) && r.pools.length ? r.pools : (Array.isArray(SW.pools) ? SW.pools : []);
-      const pools = poolIds.length ? await fetchPools(poolIds) : [];
-      if (!pools.length) {
-        console.log(`⚠️ [route ${i}] No pools returned by subgraph.`);
-      } else {
-        console.log(`📊 [route ${i}] Pools: ${pools.length}`);
-        for (const p of pools) {
-          console.log(`  - ${p.id}`);
-          console.log(`    pair: ${p.token0.symbol}/${p.token1.symbol} fee=${p.fee}`);
-          console.log(`    t0Price=${p.token0Price} t1Price=${p.token1Price} TVL=$${p.totalValueLockedUSD}`);
-        }
+    // Example config minimal — ganti sesuai kebutuhanmu:
+    const config = {
+      swap: {
+        router: process.env.ROUTER || '0x5AeFBA317BAba46EAF98Fd6f381d07673bcA6467',
+        // HARUS: calldata arah WANKR→ztUSD (atau sesuai targetmu)
+        calldata: process.env.CALLDATA || '0x',
+        tokenIn:  (process.env.TOKEN_IN  || '0xbd833b6ecc30caeabf81db18bb0f1e00c6997e7a').trim(), // WANKR
+        tokenOut: (process.env.TOKEN_OUT || '0x9423c6c914857e6daaace3b585f4640231505128').trim(), // ztUSD
+        // Step wrap (opsional, set true untuk ANKR→WANKR)
+        wrapFirst: String(process.env.WRAP_FIRST||'false'),
+        wrapRequired: String(process.env.WRAP_REQUIRED||'true'),
+        nativePay: String(process.env.NATIVE_PAY||'true'),
+        wtoken: (process.env.WTOKEN||'0xbd833b6ecc30caeabf81db18bb0f1e00c6997e7a').trim(), // WANKR
+        value: String(process.env.WRAP_VALUE||'0'), // jumlah ANKR untuk deposit()
+        gas: { addPercent: Number(process.env.GAS_ADD_PERCENT||5) },
+        patches: [
+          { mode:'findExact', old:(process.env.OLD_PAYER||'0xDc91FDbf1F8E5F470788CeBaC7e3B13DD63bd4bC'), to:'$OWNER' },
+          { mode:'auto', index: Number.isFinite(Number(process.env.RECIPIENT_WORD_INDEX)) ? Number(process.env.RECIPIENT_WORD_INDEX) : 13 },
+        ],
       }
+    };
 
-      let usedPool = null;
-      for (const p of pools) {
-        const t0 = ethers.getAddress(p.token0.id);
-        const t1 = ethers.getAddress(p.token1.id);
-        const a0 = ethers.getAddress(r.tokenIn.address);
-        const b0 = ethers.getAddress(r.tokenOut.address);
-        if ((a0 === t0 && b0 === t1) || (a0 === t1 && b0 === t0)) { usedPool = p; break; }
-      }
+    const ctx = {
+      address: owner,
+      wallet,
+      env: process.env,
+      config,
+      log: { mini: (...a)=>console.log(...a) },
+    };
 
-      const estOut = usedPool ? estimateOut(amountIn, r.tokenIn, r.tokenOut, usedPool) : 0n;
-      const minOut = applySlippage(estOut, BigInt(r.slippageBps ?? SW.slippageBps ?? 100));
-
-      const balIn = await getErc20Balance(provider, r.tokenIn, address);
-      console.log(`💼 [route ${i}] Balance ${r.tokenIn.symbol}: ${fmt(balIn, r.tokenIn.decimals)}`);
-      if (balIn < amountIn) {
-        const msg = `❌ [route ${i}] insufficient ${r.tokenIn.symbol}: need ${fmt(amountIn,r.tokenIn.decimals)}, have ${fmt(balIn,r.tokenIn.decimals)}`;
-        if ((r.enforceBalance ?? SW.enforceBalance) !== false) { console.log(msg + ' — skip route'); }
-        else { console.log(msg + ' — continue (enforceBalance=false)'); }
-        if (i < routes.length - 1 && delayMs) await sleep(delayMs);
-        continue;
-      }
-
-      console.log(`💱 [route ${i}] Plan`);
-      console.log(`  tokenIn   : ${r.tokenIn.symbol} @ ${ethers.getAddress(r.tokenIn.address)}`);
-      console.log(`  tokenOut  : ${r.tokenOut.symbol} @ ${ethers.getAddress(r.tokenOut.address)}`);
-      console.log(`  amountIn  : ${fmt(amountIn, r.tokenIn.decimals)} ${r.tokenIn.symbol}`);
-      console.log(`  estOut    : ${usedPool ? fmt(estOut, r.tokenOut.decimals) : '-'} ${r.tokenOut.symbol}`);
-      console.log(`  minOut    : ${usedPool ? fmt(minOut, r.tokenOut.decimals) : '-'} ${r.tokenOut.symbol} (slippage ${r.slippageBps ?? SW.slippageBps ?? 100} bps)`);
-      if (usedPool) console.log(`  poolUsed  : ${usedPool.id} (${usedPool.token0.symbol}/${usedPool.token1.symbol}, fee=${usedPool.fee})`);
-
-      await doRouterSwap(provider, r, { amountIn, minOut });
-
-      if (i < routes.length - 1 && delayMs) {
-        if (isDebug()) console.log(`[dbg] delay ${delayMs}ms before next route`);
-        await sleep(delayMs);
-      }
-    }
-
-  } catch (e) {
-    if (e?.code === 'BAD_DATA' && /decode/i.test(e.message || '')) {
-      console.error('❌ decode error — wrong ABI or endpoint.');
-    } else if (String(e.message || '').toLowerCase().includes('address')) {
-      console.error('❌ address error — verify token/router addresses in config.yaml');
-    } else if (String(e.message || '').toLowerCase().includes('checksum')) {
-      console.error('❌ checksum error — use checksummed/lowercase 0x addresses');
-    } else {
-      console.error('[fatal]', e.response?.status || '', e.response?.data ?? e.stack ?? e.message);
-    }
-    process.exit(1);
-  }
-})();
+    await run(ctx);
+  })().catch(e=>{ console.error(e); process.exit(1); });
+}

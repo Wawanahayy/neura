@@ -1,20 +1,6 @@
 #!/usr/bin/env node
-/**
- * turnstile-2captcha.js
- * Flow: solveCaptcha() -> getSolution() -> print token
- *
- * ENV:
- *  - API_KEY                 // 2Captcha API key (wajib)
- *  - TURNSTILE_SITE_KEY      // sitekey turnstile (wajib)
- *  - TURNSTILE_PAGE_URL      // page url tempat captcha muncul (wajib)
- *  - POLL_MS=5000            // interval polling hasil (ms)
- *  - MAX_WAIT_SEC=180        // batas waktu total tunggu (detik)
- *
- * Jalankan:
- *   API_KEY=xxxx TURNSTILE_SITE_KEY=... TURNSTILE_PAGE_URL=https://example.com node turnstile-2captcha.js
- * Output:
- *   hanya token (OK|... diparsing). Jika sukses → token dicetak ke stdout.
- */
+// index.js solve turnstile via captcha service 
+// turnstile.js
 
 const axios = require('axios');
 require('dotenv').config();
@@ -36,7 +22,6 @@ const api = axios.create({
   timeout: 60000,
 });
 
-/** Submit captcha job, return captchaId */
 async function solveCaptcha() {
   const res = await api.post('/in.php', null, {
     params: {
@@ -55,7 +40,6 @@ async function solveCaptcha() {
     return id;
   }
 
-  // beberapa error umum
   const known = [
     'ERROR_WRONG_USER_KEY',
     'ERROR_ZERO_BALANCE',
@@ -73,10 +57,10 @@ async function solveCaptcha() {
   throw new Error(`2Captcha submit error: ${body}`);
 }
 
-/** Poll until solution or timeout, return token string */
+
 async function getSolution(captchaId) {
   const start = Date.now();
-  // rekomendasi 2captcha: tunggu 5s sebelum polling pertama kali
+
   await sleep(POLL_MS);
 
   while (true) {
@@ -111,14 +95,11 @@ async function getSolution(captchaId) {
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-/** CLI runner */
 (async () => {
   try {
     const id = await solveCaptcha();
-    // console.error supaya stdout bersih hanya token
     console.error(`[2captcha] submitted, id=${id}`);
     const token = await getSolution(id);
-    // hanya token ke stdout:
     process.stdout.write(token + '\n');
     process.exit(0);
   } catch (err) {
@@ -127,5 +108,4 @@ function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
   }
 })();
 
-// optional export kalau mau di-import dari file lain
 module.exports = { solveCaptcha, getSolution };

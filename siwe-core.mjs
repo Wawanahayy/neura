@@ -83,7 +83,6 @@ async function siweFlowOnce({ pk, base, proxyUrl, timeoutMs }) {
     mode:'login-or-sign-up'
   };
   let r2 = await http.post('/api/v1/siwe/authenticate', payload);
-  // kalau 401/403, ulangi tanpa header auth/cookie (bersih)
   if (r2.status === 401 || r2.status === 403) {
     const { authorization, Cookie, ...rest } = http.defaults.headers.common || {};
     const clean = axios.create({
@@ -94,7 +93,6 @@ async function siweFlowOnce({ pk, base, proxyUrl, timeoutMs }) {
   }
   if (r2.status >= 400) throw new Error(`siwe.authenticate ${r2.status}`);
 
-  // AMBIL COOKIES + BEARER
   const setCookies = r2.headers?.['set-cookie'] || [];
   const bag = {};
   for (const sc of setCookies) {
@@ -109,12 +107,6 @@ async function siweFlowOnce({ pk, base, proxyUrl, timeoutMs }) {
   return { address, bearer, cookies: bag, baseUsed: base };
 }
 
-/**
- * siweLogin — kuat terhadap timeout/jaringan
- * opsi:
- *   proxyUrl, timeoutMs (default 20000), retries (default 2), allowNoProxyFallback ('1' untuk aktif)
- *   altBases: array fallback bases (default: [process.env.PRIVY_BASE, 'https://privy.neuraprotocol.io'])
- */
 export async function siweLogin(pk, opts={}){
   const {
     proxyUrl,
@@ -129,21 +121,18 @@ export async function siweLogin(pk, opts={}){
     : [ process.env.PRIVY_BASE, 'https://privy.neuraprotocol.io' ].filter(Boolean);
 
   let lastErr;
-  // coba semua base, dengan retry per base
   for (const base of bases) {
     for (let i=0;i<=retries;i++){
       try {
         return await siweFlowOnce({ pk, base, proxyUrl, timeoutMs });
       } catch (e) {
         lastErr = e;
-        // Kalau timeout & diizinkan fallback tanpa proxy → coba sekali tanpa proxy
         const isTimeout = (e.code==='ECONNABORTED') || /timeout/i.test(e.message || '');
         if (isTimeout && allowNoProxyFallback && proxyUrl) {
           try {
             return await siweFlowOnce({ pk, base, proxyUrl: null, timeoutMs });
           } catch(e2){ lastErr = e2; }
         }
-        // delay kecil sebelum retry
         await sleep(300 + Math.random()*300);
       }
     }

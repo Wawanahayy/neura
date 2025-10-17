@@ -1,5 +1,4 @@
 #!/usr/bin/env node
-// bridge.mjs — auto-try several common deposit method signatures + optional native value + fallback transfer
 
 import { ethers } from 'ethers';
 
@@ -54,7 +53,6 @@ async function ensureAllowance({ signer, tokenAddr, owner, spender, wantAmount, 
 }
 
 function buildCandidates({ amount, recipient }) {
-  // urutan paling umum dulu
   return [
     { sig: 'function deposit(uint256 _amount, address _recipient)', args: [ amount, recipient ] },
     { sig: 'function deposit(address _recipient, uint256 _amount)', args: [ recipient, amount ] },
@@ -68,7 +66,6 @@ async function tryCallOne({ signer, to, cand, value, gasLimit, log }) {
   const iface = new ethers.Interface([ cand.sig ]);
   const data  = iface.encodeFunctionData(iface.fragments[0].name, cand.args);
 
-  // 1) coba estimateGas (kalau revert, provider kasih CALL_EXCEPTION)
   try {
     await signer.estimateGas({ to, data, value: value ?? 0n });
   } catch (e) {
