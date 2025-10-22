@@ -1,5 +1,9 @@
 #!/usr/bin/env node
-// multiroute-swap.mjs — multi-route swap with autoback, robust wrap, retries, and quiet/debug logs
+// multiroute-swap.mjs — multi-route swap with autoback, robust wrap, retries, quiet/debug logs
+// Patch: RPC retry helpers (call/estimate/receipt) to avoid -32064 "Proxy error"
+// Patch+: Fee Top-Up Guard (ensure ANKR >= minNative); skip safely if zero balances
+// Patch++: JSON-RPC BigInt serialize fix (no raw BigInt in provider.send payloads)
+// Patch+++: GasLimit headroom (limitBumpPercent/limitAdd/minGasLimit) + back-route bump + typo fix
 
 import 'dotenv/config';
 import { ethers } from 'ethers';
@@ -20,15 +24,97 @@ const shortHash = (h, n=5) => {
   if (!b) return '';
   return '0x' + b.slice(0, n) + '…';
 };
+const get = (o,p,d)=>{ try{ return p.split('.').reduce((x,k)=> (x&&k in x)?x[k]:undefined,o) ?? d; }catch{ return d; } };
 
 // ---------- logging skeleton ----------
 const noopLog = {
-  mini: (...a)=>console.log(...a),       // always (but content already compact)
-  essential: (...a)=>console.log(...a),  // always (compact for retries)
-  dbg:  (..._a)=>{},                     // debugApi/debugAll
-  insp: (..._a)=>{},                     // debugAll
+  mini: (...a)=>console.log(...a),
+  essential: (...a)=>console.log(...a),
+  dbg:  (..._a)=>{},
+  insp: (..._a)=>{},
   mode: 'silent'
 };
+
+// ---------- RPC retry helpers ----------
+const isTransientRpcError = (e) => {
+  const msg = String(e?.shortMessage || e?.message || '');
+  const code = e?.code ?? e?.error?.code;
+  const emsg = String(e?.error?.message || '');
+  return (
+    code === -32064 || /Proxy error/i.test(msg) || /Proxy error/i.test(emsg) ||
+    /ETIMEDOUT|ECONNRESET|ENETUNREACH|EAI_AGAIN/i.test(msg) ||
+    /could not coalesce/i.test(msg)
+  );
+};
+
+// 🆕 encode tx object to avoid raw BigInt in JSON-RPC
+function encodeTxObjForRpc({ from, to, data, value }) {
+  const tx = {};
+  if (from) tx.from = from;
+  if (to)   tx.to   = to;
+  if (data) tx.data = data;
+
+  // only include value if > 0, and encode as hex string
+  if (typeof value === 'bigint') {
+    if (value > 0n) tx.value = ethers.toBeHex(value);
+  } else if (value != null) {
+    try {
+      const bn = BigInt(value);
+      if (bn > 0n) tx.value = ethers.toBeHex(bn);
+    } catch {
+      // ignore non-numeric
+    }
+  }
+  return tx;
+}
+
+async function providerCallWithRetry(provider, method, params = [], {
+  tries = 6, base = 600, backoff = 1.9, jitter = 250, log = noopLog
+} = {}) {
+  let delay = base;
+  for (let t = 1; t <= tries; t++) {
+    try { return await provider.send(method, params); }
+    catch (e) {
+      if (!isTransientRpcError(e) || t === tries) throw e;
+      const wait = delay + Math.floor(Math.random() * jitter);
+      log.essential?.(`[retry rpc] ${method} ${t}/${tries-1} · ${e?.error?.message || e.message} · wait ${wait}ms`);
+      await sleep(wait);
+      delay = Math.floor(delay * backoff);
+    }
+  }
+}
+
+async function callWithRetry(provider, req, opts) {
+  const tx = encodeTxObjForRpc(req || {});
+  return providerCallWithRetry(provider, 'eth_call', [tx, 'latest'], opts);
+}
+
+async function estimateGasWithRetry(provider, txReq, opts) {
+  const tx = encodeTxObjForRpc(txReq || {});
+  return providerCallWithRetry(provider, 'eth_estimateGas', [tx], opts);
+}
+
+async function getReceiptWithRetry(provider, txHash, opts) {
+  return providerCallWithRetry(provider, 'eth_getTransactionReceipt', [txHash], opts);
+}
+
+async function waitForReceiptSafe(provider, txHash, {
+  pollMs = 4000, totalMs = 300_000, log = noopLog,
+  tries = 4, base = 500, backoff = 1.9, jitter = 250
+} = {}) {
+  const start = Date.now();
+  while (Date.now() - start < totalMs) {
+    try {
+      const rc = await getReceiptWithRetry(provider, txHash, { tries, base, backoff, jitter, log });
+      if (rc) return rc; // null → belum mined
+    } catch (e) {
+      if (!isTransientRpcError(e)) throw e;
+      log.essential?.(`[retry receipt] ${e?.error?.message || e.message}`);
+    }
+    await sleep(pollMs);
+  }
+  throw new Error('waitForReceiptSafe timeout');
+}
 
 // ---------- word dump ----------
 function dumpWords(data, log=noopLog){
@@ -115,6 +201,9 @@ const WETH_LIKE_ABI=[
   'function deposit() payable',
   'function balanceOf(address) view returns (uint256)',
 ];
+const WETH_WITHDRAW_ABI=[
+  'function withdraw(uint256)'
+];
 
 // ---------- balances & allowance ----------
 async function getErc20Balance(provider, token, owner){
@@ -123,7 +212,6 @@ async function getErc20Balance(provider, token, owner){
 
 async function ensureAllowance({provider, wallet, token, owner, spender, wantAmount, log=noopLog}){
   const c = new ethers.Contract(token, ERC20_ABI, provider);
-  // Keep allowance chatter in debug only
   let dec=18; try { dec = await c.decimals(); } catch {}
   try {
     const [bal, cur] = await Promise.all([ c.balanceOf(owner), c.allowance(owner, spender) ]);
@@ -145,7 +233,7 @@ async function ensureAllowance({provider, wallet, token, owner, spender, wantAmo
 
 async function checkBalanceAndApprove({provider, signer, owner, token, spender, needAmount, log}) {
   const bal = await getErc20Balance(provider, token, owner);
-  if (bal === 0n) { log.dbg(`[check] saldo ${token} = 0`); } // silent: hide
+  if (bal === 0n) { log.dbg(`[check] saldo ${token} = 0`); }
   const need = needAmount && needAmount>0n ? needAmount : (ethers.MaxUint256/4n);
   await ensureAllowance({provider, wallet: signer, token, owner, spender, wantAmount: need, log});
   return bal;
@@ -162,11 +250,9 @@ async function buildGasOverrides(provider, add=0){
 // ---------- wrap (support "max") ----------
 async function doWrapIfNeeded({ provider, wallet, owner, SW, log=noopLog, minNativeForFeeBN=0n, wrapRetry }) {
   if (!truthy(SW.wrapFirst)) return { attempted:false, ok:true };
-
   const wtoken = SW.wtoken;
   if (!isAddr(wtoken)) { log.dbg('[wrap] skip: wtoken invalid'); return { attempted:false, ok:true }; }
 
-  // Resolve value: number | "max"
   let value = 0n;
   if (String(SW.value).toLowerCase()==='max'){
     const native = await provider.getBalance(owner);
@@ -180,31 +266,21 @@ async function doWrapIfNeeded({ provider, wallet, owner, SW, log=noopLog, minNat
 
   const tryWrap = async () => {
     const w = new ethers.Contract(wtoken, WETH_LIKE_ABI, provider).connect(wallet);
-
-    // helper path
     try {
       const tx = await w.deposit({ value });
       const rc = await tx.wait(1);
       log.mini(`wrap success tx ${shortHash(tx.hash)}`);
       return true;
-    } catch (e) {
-      log.dbg(`[wrap] helper deposit() failed: ${e?.shortMessage||e?.reason||e?.message||String(e)}`);
-    }
-
-    // fallback raw send
+    } catch (e) { log.dbg(`[wrap] helper deposit() failed: ${e?.shortMessage||e?.message||String(e)}`); }
     try {
       const gasLimit = Number(SW.wrapGasLimit || 120000);
       const tx = await wallet.sendTransaction({ to: wtoken, data: '0xd0e30db0', value, gasLimit });
       await tx.wait(1);
       log.mini(`wrap success tx ${shortHash(tx.hash)}`);
       return true;
-    } catch (e2) {
-      const msg2 = e2?.shortMessage || e2?.reason || e2?.message || String(e2);
-      throw new Error(msg2);
-    }
+    } catch (e2) { throw new Error(e2?.shortMessage||e2?.message||String(e2)); }
   };
 
-  // retry wrap — compact retry lines
   const tries = wrapRetry?.attempts ?? 1;
   const delayMs = wrapRetry?.delayMs ?? 0;
   const backoff = wrapRetry?.backoff ?? 1.0;
@@ -231,9 +307,7 @@ async function attemptLoop({ name, tries, delayMs, backoff, jitterMs, onAttempt,
   for (let i=1; i<=tries; i++){
     try{
       if (i>1){
-        // compact retry line
         log.essential(`[retry ${name}] ${i}/${tries}`);
-        // still keep timing behavior
         const jitter = jit ? Math.floor((Math.random()*2-1)*jit) : 0;
         const wait = Math.max(0, d + jitter);
         await sleep(wait);
@@ -251,7 +325,6 @@ async function runOneRoute({ ctx, SWin, owner, signer, provider, globalFlags }){
   const log = ctx.log || noopLog;
   const DEBUG_ALL = ctx.DEBUG_ALL;
 
-  // clone route (avoid mutating shared object)
   const SW = { ...(SWin||{}) };
 
   const ROUTER = String(SW.router||'').trim();
@@ -260,17 +333,27 @@ async function runOneRoute({ ctx, SWin, owner, signer, provider, globalFlags }){
   const STRICT_A_ONLY = !!(globalFlags?.STRICT_A_ONLY);
   const RESIM_BEFORE = !!(globalFlags?.RESIM_BEFORE);
 
-  // retry settings (global/route)
+  // retry settings
   const tries   = Number(SW?.retry?.attempts ?? ctx.config?.swap?.retry?.attempts ?? 3);
   const delayMs = Number(SW?.retry?.delayMs ?? ctx.config?.swap?.retry?.delayMs ?? 10_000);
   const backoff = Number(SW?.retry?.backoff ?? ctx.config?.swap?.retry?.backoff ?? 1.0);
   const jitterMs= Number(SW?.retry?.jitterMs ?? ctx.config?.swap?.retry?.jitterMs ?? 0);
 
+  // rpc retry defaults
+  const rpcRetry = {
+    tries : Number(ctx.config?.swap?.rpcRetry?.tries ?? 6),
+    base  : Number(ctx.config?.swap?.rpcRetry?.base ?? 600),
+    backoff: Number(ctx.config?.swap?.rpcRetry?.backoff ?? 1.9),
+    jitter : Number(ctx.config?.swap?.rpcRetry?.jitter ?? 250),
+    pollMs : Number(ctx.config?.swap?.rpcRetry?.pollMs ?? 4000),
+    totalMs: Number(ctx.config?.swap?.rpcRetry?.totalMs ?? 300_000),
+  };
+
   // min native fee for wrap:max
   const minFeeStr = String(ctx?.config?.swap?.minNativeForFee || '0');
   let minNativeForFeeBN = 0n; try { minNativeForFeeBN = ethers.parseUnits(minFeeStr || '0', 18); } catch {}
 
-  // 0) Optional wrap (supports "max")
+  // 0) Optional wrap
   try { await doWrapIfNeeded({ provider, wallet: signer, owner, SW, log, minNativeForFeeBN, wrapRetry: { attempts: tries, delayMs, backoff } }); } catch {}
 
   // 1) Raw calldata
@@ -350,18 +433,30 @@ async function runOneRoute({ ctx, SWin, owner, signer, provider, globalFlags }){
     delayMs, backoff, jitterMs,
     log,
     onAttempt: async (_idx)=>{
-      // simulate
+
+      // simulate (retry)
       try {
-        await provider.call({ from: owner, to: ROUTER, data, value: 0n });
+        await callWithRetry(provider, { from: owner, to: ROUTER, data, value: 0n }, {
+          tries: rpcRetry.tries, base: rpcRetry.base, backoff: rpcRetry.backoff, jitter: rpcRetry.jitter, log
+        });
       } catch (e) {
         await checkBalanceAndApprove({provider, signer, owner, token: pick.tokenIn, spender: ROUTER, needAmount: needBefore, log});
         throw e;
       }
 
-      // estimateGas
+      // estimateGas (retry) + headroom
       let gasLimit;
       try{
-        gasLimit=await provider.estimateGas({ from: owner, to: ROUTER, data, value: 0n });
+        const est = await estimateGasWithRetry(provider, { from: owner, to: ROUTER, data, value: 0n }, {
+          tries: rpcRetry.tries, base: rpcRetry.base, backoff: rpcRetry.backoff, jitter: rpcRetry.jitter, log
+        });
+        const pct = BigInt(SW?.gas?.limitBumpPercent ?? ctx.config?.swap?.gas?.limitBumpPercent ?? 25);
+        const add = BigInt(SW?.gas?.limitAdd         ?? ctx.config?.swap?.gas?.limitAdd         ?? 30000);
+        const min = BigInt(SW?.gas?.minGasLimit      ?? ctx.config?.swap?.gas?.minGasLimit      ?? 0);
+        let bumped = (BigInt(est) * (100n + pct)) / 100n + add;
+        if (bumped < min) bumped = min;
+        gasLimit = bumped;
+        log.dbg(`[gas] est=${est} → bumped=${gasLimit} (pct=${pct}%, +${add})`);
       }catch(e){
         await checkBalanceAndApprove({provider, signer, owner, token: pick.tokenIn, spender: ROUTER, needAmount: needBefore, log});
         throw e;
@@ -370,7 +465,9 @@ async function runOneRoute({ ctx, SWin, owner, signer, provider, globalFlags }){
       // resimulate before send
       if (RESIM_BEFORE) {
         try {
-          await provider.call({ from: owner, to: ROUTER, data, value: 0n });
+          await callWithRetry(provider, { from: owner, to: ROUTER, data, value: 0n }, {
+            tries: rpcRetry.tries, base: rpcRetry.base, backoff: rpcRetry.backoff, jitter: rpcRetry.jitter, log
+          });
         } catch (e) {
           await checkBalanceAndApprove({provider, signer, owner, token: pick.tokenIn, spender: ROUTER, needAmount: needBefore, log});
           throw e;
@@ -387,19 +484,23 @@ async function runOneRoute({ ctx, SWin, owner, signer, provider, globalFlags }){
         throw eSend;
       }
 
-      // wait receipt
+      // wait receipt (retry polling; avoids -32064 Proxy error)
       if(SW?.waitForReceipt!==false){
-        try {
-          const rc=await tx.wait(Number(SW?.confirmations??1)||1);
-          if (rc.status !== 1) { throw new Error('onchain revert'); }
-          txHash = tx.hash;
-          // ✅ compact success line
-          log.mini(`swap ${SW.name||'-'} success tx ${shortHash(txHash)}`);
-        } catch (eRc) {
-          throw eRc;
+        const rc = await waitForReceiptSafe(provider, tx.hash, {
+          pollMs : rpcRetry.pollMs,
+          totalMs: rpcRetry.totalMs,
+          tries  : Math.max(4, rpcRetry.tries),
+          base   : rpcRetry.base,
+          backoff: rpcRetry.backoff,
+          jitter : rpcRetry.jitter,
+          log
+        });
+        if (!rc || String(rc.status) !== '0x1') {
+          throw new Error('onchain revert');
         }
+        txHash = tx.hash;
+        log.mini(`swap ${SW.name||'-'} success tx ${shortHash(txHash)}`);
       } else {
-        // no wait: still show a compact "sent" line
         txHash = tx.hash;
         log.mini(`swap ${SW.name||'-'} sent tx ${shortHash(txHash)}`);
       }
@@ -410,18 +511,165 @@ async function runOneRoute({ ctx, SWin, owner, signer, provider, globalFlags }){
   return { ok:true, txHash };
 }
 
+// ---------- fee top-up helpers ----------
+function pickWTokenFromCfg(cfg){
+  // prioritas: route yang punya wtoken → balances.networks[0].erc20.address
+  const rs = get(cfg,'swap.routes',[]);
+  if (Array.isArray(rs)) {
+    const rWith = rs.find(r => r && r.wtoken);
+    if (rWith && isAddr(rWith.wtoken)) return rWith.wtoken;
+  }
+  const fromBalances = get(cfg,'balances.networks.0.erc20.address', null);
+  return isAddr(fromBalances) ? fromBalances : null;
+}
+function pickBackRouteByName(cfg, name='ztusd/wankr'){
+  const rs = get(cfg,'swap.routes',[]);
+  if (!Array.isArray(rs)) return null;
+  return rs.find(x => String(x?.name||'').toLowerCase() === String(name).toLowerCase()) || null;
+}
+function pickZtusdFromCfg(cfg){
+  // ambil tokenIn dari route ztusd/wankr
+  const r = pickBackRouteByName(cfg,'ztusd/wankr');
+  return r?.tokenIn && isAddr(r.tokenIn) ? r.tokenIn : null;
+}
+
+async function execBackRouteOnce({ ctx, route, provider, signer }){
+  const log = ctx.log || noopLog;
+  const rpcRetry = {
+    tries : Number(ctx.config?.swap?.rpcRetry?.tries ?? 6),
+    base  : Number(ctx.config?.swap?.rpcRetry?.base ?? 600),
+    backoff: Number(ctx.config?.swap?.rpcRetry?.backoff ?? 1.9),
+    jitter : Number(ctx.config?.swap?.rpcRetry?.jitter ?? 250),
+    pollMs : Number(ctx.config?.swap?.rpcRetry?.pollMs ?? 4000),
+    totalMs: Number(ctx.config?.swap?.rpcRetry?.totalMs ?? 300_000),
+  };
+
+  const to   = String(route.router);
+  const data = String(route.calldata);
+  const value= 0n;
+
+  // Light simulate + estimate (now safe via encodeTxObjForRpc)
+  await callWithRetry(provider, { from: await signer.getAddress(), to, data, value }, rpcRetry);
+
+  const est = await estimateGasWithRetry(provider, { from: await signer.getAddress(), to, data, value }, rpcRetry);
+  const pct = BigInt(route?.gas?.limitBumpPercent ?? ctx.config?.swap?.gas?.limitBumpPercent ?? 25);
+  const add = BigInt(route?.gas?.limitAdd         ?? ctx.config?.swap?.gas?.limitAdd         ?? 30000);
+  const min = BigInt(route?.gas?.minGasLimit      ?? ctx.config?.swap?.gas?.minGasLimit      ?? 0);
+  let gasLimit = (BigInt(est) * (100n + pct)) / 100n + add;
+  if (gasLimit < min) gasLimit = min;
+  log.dbg(`[gas][back] est=${est} → bumped=${gasLimit}`);
+
+  const gasOv = await buildGasOverrides(provider, Number(route?.gas?.addPercent ?? 0));
+  const tx = await signer.sendTransaction({ to, data, value, gasLimit, ...gasOv });
+  const rc = await waitForReceiptSafe(provider, tx.hash, rpcRetry);
+  if (!rc || String(rc.status) !== '0x1') throw new Error('back route revert');
+  log.mini(`[feeTopup] execRouteOnce ${route.name} ✅ tx=${shortHash(tx.hash)}`);
+  return rc;
+}
+
+async function unwrapWToken({ provider, signer, wtoken, amountWei, log=noopLog }){
+  const c = new ethers.Contract(wtoken, WETH_WITHDRAW_ABI, provider).connect(signer);
+  const tx = await c.withdraw(amountWei);
+  const rc = await tx.wait(1);
+  log.mini(`[feeTopup] unwrap WANKR → ANKR: ${ethers.formatUnits(amountWei,18)} (tx ${shortHash(tx.hash)})`);
+  return rc;
+}
+
+// ---------- Fee Top-Up (SKIP if truly no balances) ----------
+async function ensureNativeFee(ctx, { provider, signer }){
+  try{
+    const { address: owner, config, log=noopLog } = ctx;
+
+    const feeCfg   = get(config,'swap.feeTopup', {});
+    const enabled  = feeCfg?.enabled !== false;                   // default ON
+    const minNStr  = String(feeCfg?.minNative ?? '0.02');
+    const bufStr   = String(feeCfg?.buffer    ?? '0.005');
+    const maxTries = Number(feeCfg?.maxTries ?? 2);
+    const backName = String(feeCfg?.preferRouteBack || 'ztusd/wankr');
+
+    if (!enabled) return;
+
+    const minN  = ethers.parseUnits(minNStr, 18);
+    const buf   = ethers.parseUnits(bufStr, 18);
+
+    let nativeBal = await provider.getBalance(owner);
+    if (nativeBal >= minN) return; // cukup
+
+    const wtoken = pickWTokenFromCfg(config);
+    const ztusd  = pickZtusdFromCfg(config);
+
+    const wbal = wtoken ? await getErc20Balance(provider, wtoken, owner) : 0n;
+    const zbal = ztusd  ? await getErc20Balance(provider, ztusd,  owner) : 0n;
+
+    // Semua benar-benar nol → SKIP (jangan stop modul)
+    if (nativeBal===0n && wbal===0n && zbal===0n){
+      log.mini('[feeTopup] skip (no balances: ANKR=0, WANKR=0, ztUSD=0)');
+      return;
+    }
+
+    const target = minN + buf;
+    let need = target > nativeBal ? (target - nativeBal) : 0n;
+    if (need === 0n) return;
+
+    // 1) Prioritas: unwrap WANKR secukupnya
+    if (wtoken && wbal>0n){
+      const pull = need > wbal ? wbal : need;
+      if (pull > 0n){
+        try{
+          await unwrapWToken({ provider, signer, wtoken, amountWei: pull, log });
+          nativeBal = await provider.getBalance(owner);
+          if (nativeBal >= minN) { log.mini('[feeTopup] OK (from WANKR unwrap)'); return; }
+          need = target > nativeBal ? (target - nativeBal) : 0n;
+        }catch(e){ log.mini(`[feeTopup] unwrap fail: ${e?.shortMessage||e?.message||String(e)}`); }
+      }
+    }
+
+    // 2) Back route: ztusd/wankr → unwrap
+    const backRoute = pickBackRouteByName(config, backName);
+    if (!backRoute){
+      log.mini(`[feeTopup] skip (back route "${backName}" not found)`);
+      return;
+    }
+    if (!ztusd || zbal===0n){
+      log.mini('[feeTopup] skip (no ztUSD to convert)');
+      return;
+    }
+    if (!wtoken){ log.mini('[feeTopup] skip (no WANKR address to unwrap)'); return; }
+
+    for (let i=1; i<=maxTries; i++){
+      try{
+        log.mini(`[feeTopup] try ${i}/${maxTries}: swap ${backName} → unwrap`);
+        await execBackRouteOnce({ ctx, route: backRoute, provider, signer });
+
+        const w2 = await getErc20Balance(provider, wtoken, owner);
+        if (w2 > 0n){
+          const pull = w2 > need ? need : w2;
+          if (pull > 0n){
+            await unwrapWToken({ provider, signer, wtoken, amountWei: pull, log });
+            nativeBal = await provider.getBalance(owner);
+            if (nativeBal >= minN){ log.mini('[feeTopup] OK (from back route)'); return; }
+            need = target > nativeBal ? (target - nativeBal) : 0n;
+          }
+        }
+      }catch(e){ log.mini(`[feeTopup] back route fail: ${e?.shortMessage||e?.message||String(e)}`); }
+    }
+
+    log.mini('[feeTopup] done (insufficient after tries, skipped further)');
+  }catch(err){
+    try{ ctx?.log?.warn?.('[feeTopup] error '+(err?.shortMessage||err?.message||String(err))); }catch{}
+  }
+}
+
 // ---------- main (with autoback schedule, no early exit) ----------
 export async function run(ctx){
-  // logger setup
   const level = String(ctx?.config?.log?.level || process.env.LOG_LEVEL || 'silent').toLowerCase();
   const DEBUG_ALL = level==='debugall';
   const DEBUG_API = DEBUG_ALL || level==='debugapi';
 
   const baseMini = ctx?.log?.mini || ((...a)=>console.log(...a));
   const log = {
-    // compact emitters for silent (we already keep messages compact at call sites)
     mini: (...a)=>baseMini(...a),
-    essential: (...a)=>baseMini(...a),  // used for [retry ...]
+    essential: (...a)=>baseMini(...a),
     dbg: (...a)=>{ if (DEBUG_API) baseMini(...a); },
     insp: (...a)=>{ if (DEBUG_ALL) baseMini(...a); },
     mode: level
@@ -431,6 +679,9 @@ export async function run(ctx){
   const RPC = env.NEURA_RPC || env.RPC_URL || 'https://testnet.rpc.neuraprotocol.io';
   const provider = new ethers.JsonRpcProvider(RPC);
   const signer = wallet.connect(provider);
+
+  // Top-up GAS lebih dulu supaya route pertama pasti cukup fee
+  try { await ensureNativeFee(ctx, { provider, signer }); } catch {}
 
   const SW = config.swap || {};
   const STRICT_A_ONLY = !!SW.strictAOnly;
@@ -472,13 +723,15 @@ export async function run(ctx){
     for (const r of selected) for (let i=1; i<=r.times; i++) execQueue.push({ ...r, _cycle: i, _seq: 1 });
   }
 
-  // startup line only in debug
   log.dbg(`[multi] useRouter="${rawUse||'all'}" → ${execQueue.map(r=>r.name).join(', ')}`);
 
   let anySuccess = false;
   for (const r of execQueue) {
     const tag = (r.times>1 || doAutoback) ? `${r.name}` : r.name;
     try {
+      // Jaga-jaga: setelah route sebelumnya, saldo native bisa turun — isi ulang dulu kalau di bawah ambang
+      try { await ensureNativeFee(ctx, { provider, signer }); } catch {}
+
       const res = await runOneRoute({
         ctx: { ...ctx, log, DEBUG_ALL, config },
         SWin: r, owner, signer, provider,
@@ -489,18 +742,18 @@ export async function run(ctx){
       });
       if (res.ok) {
         anySuccess = true;
-        // success line already printed by runOneRoute
       } else {
-        // compact failure
         log.mini(`swap ${tag} error: ${res.reason}`);
       }
     } catch (e) {
       const msg = e?.shortMessage || e?.reason || e?.message || String(e);
       log.mini(`swap ${tag} error: ${msg}`);
-      // keep going to next route
     }
   }
   if (!anySuccess) log.mini(`swap all error`);
+
+  // Final guard (opsional): setelah semua selesai, top-up lagi jika masih kurang
+  await ensureNativeFee(ctx, { provider, signer });
 }
 
 export default { run };
@@ -540,7 +793,33 @@ if (import.meta.url === `file://${process.argv[1]}`) {
           jitterMs: Number(process.env.RETRY_JITTER_MS||0),
         },
 
+        // RPC polling + call/estimate retry knobs
+        rpcRetry: {
+          tries:   Number(process.env.RPC_TRIES||6),
+          base:    Number(process.env.RPC_BASE_MS||600),
+          backoff: Number(process.env.RPC_BACKOFF||1.9),
+          jitter:  Number(process.env.RPC_JITTER_MS||250),
+          pollMs:  Number(process.env.RPC_POLL_MS||4000),
+          totalMs: Number(process.env.RPC_TOTAL_MS||300000),
+        },
+
         wrapGasLimit: Number(process.env.WRAP_GAS_LIMIT||120000),
+
+        // Optional feeTopup config via env (fallback defaults jika tidak ada)
+        feeTopup: {
+          enabled: String(process.env.FEE_TOPUP_ENABLED||'true')!=='false',
+          minNative: process.env.FEE_TOPUP_MIN_NATIVE || '0.02',
+          buffer: process.env.FEE_TOPUP_BUFFER || '0.005',
+          maxTries: Number(process.env.FEE_TOPUP_MAX_TRIES||3),
+          preferRouteBack: process.env.FEE_TOPUP_BACK_NAME || 'ztusd/wankr',
+        },
+
+        // global gas headroom default (bisa dioverride per route di YAML)
+        gas: {
+          limitBumpPercent: Number(process.env.GAS_LIMIT_BUMP_PCT||25),
+          limitAdd: Number(process.env.GAS_LIMIT_ADD||30000),
+          minGasLimit: Number(process.env.GAS_MIN_LIMIT||0)
+        },
 
         routes: [
           // isi YAML kamu
