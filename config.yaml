@@ -1,59 +1,70 @@
 ui:
-  enabled: true
-  panels: 4
-  maxPerPanel: 10
+  enabled: true          # aktifkan TUI
+  panels: 12              # 4 kotak (2x2). Bisa 6 (3x2) atau 9 (3x3)
+  maxPerPanel: 12        # maksimal 10 akun per kotak
   timestamp: false
-  sessionBar: true    
-  sessionHeightPct: 22  
-  compactSwapLogs: true  
-  compactTaskLogs: true   
-  strictCompact: true     
-  maxLinesPerPanel: 120   
-  truncateWidth: 50       
+  sessionBar: true       # aktifkan 1 panel SESSION global (login/expiry/relogin)
+  sessionHeightPct: 22   # tinggi SESSION bar (persen)
+  compactSwapLogs: true   # ringkas log swap
+  compactTaskLogs: true   # ringkas log task
+  strictCompact: true     # <— drop semua yang tidak masuk allowlist
+  maxLinesPerPanel: 120   # batasi jumlah baris per panel
+  truncateWidth: 200       # potong panjang setiap baris
   muteRpcErrors: true
+  disableTicker: false  # biar ada interval yg bikin proses tetap hidup
+
 
 auth:
-  loginTries: 5     
+  loginTries: 5      # jumlah percobaan login awal
   minGapMs: 9000
   rateBaseMs: 4000
   rateBackoff: 1.8
   rateJitterMs: 500
-  loginStaggerMs: 1000     
-  loginConcurrency: 1
+  loginStaggerMs: 1000      # jeda antar login (ms)
+  loginConcurrency: 5
 keepAlive:
   renewSkewMs: 900000
+  idleOnly: true   # hidupkan mode idle
+  hours: 24        # tahan 24 jam
+  sleepMs: 300000  # jeda antar ping (5 menit)
+  ping:
+    enabled: true
 
 authGuard:
   checkMs: 120000
   jitterMs: 15000
   staggerMs: 3000
+  maxFails: 3
+  coolOffMs: 1800000
 
 flow:
-  loginBatchSize: 4
-  perAccountMax: 4
-  maxConcurrency: 4
+  loginBatchSize:
+  perAccountMax: 12
+  maxConcurrency: 12
+  batchPasses: 2           # berapa PASS rebatch (coba lagi) sebelum skip permanen
+  betweenBatchesMs: 4000   # jeda antar batch
   repeatRounds: true
-  betweenBatchesMs: 5000
-  idleMs: 300000
+  idleMs: 3000
   betweenAccountsMs: 0
   mode: grouped
   parallelGroups:
-    - [game, collect, task]
+    - [game, collect]
     - [faucet]
     - [bridge]
     - [swap]
-  order: [game, collect, faucet, task]
+    - [task]
+  order: [game, faucet, swap, task, swap, swap, task]
 
   afterAll:
-    enabled: true
+    enabled: false  #nonaktif kalau aktife = true
     modules: [swap]                # modul akhir untuk SEMUA akun
     concurrency: 4
-    rounds: 1
+    rounds: 5
     delayBetweenModulesMs: 1500
     delayBetweenRoundsMs: 5000
 
 log:
-  level: silent          # debugapi / debugALL
+  level: silent          # biar panel gak kebanjiran; pakai debugapi kalau perlu
   socketLevel: on
   showHeaders: false
   maxBodyChars: 180
@@ -161,7 +172,7 @@ collect:
     - invalid pulse
 
 swap:
-  minNativeForFee: "0.1"
+  minNativeForFee: "0.2"
   autoback: true
   autobackCycles: 5
   useRouter: "wankr/ztusd,ztusd/wankr"
@@ -169,21 +180,38 @@ swap:
   disallowForceSend: true
   resimulateBeforeSend: true
   retry:
-    attempts: 3       
-    delayMs: 10000    
-    backoff: 1.0      
-    jitterMs: 250     
+    attempts: 3       # berapa kali dicoba
+    delayMs: 10000    # jeda antar percobaan (default 10 detik)
+    backoff: 1.0      # 1.0 = tetap; >1.0 = bertambah tiap retry
+    jitterMs: 250     # opsional: jitter +- ms
+    tries: 6
+    base: 100
+
+  rpcRetry:
+    tries: 6
+    base: 600
+    backoff: 1.9
+    jitter: 250
+    pollMs: 4000
+    totalMs: 300000
+
+  feeTopup:
+    enabled: true
+    minNative: "0.1"
+    buffer: "0.03"
+    maxTries: 3
+    preferRouteBack: "ztusd/wankr"
 
   routes:
     - name: "wankr/ztusd"
-      amount: "max"              
+      amount: "max"                  # max = semua saldo WANKR
       router: "0x5AeFBA317BAba46EAF98Fd6f381d07673bcA6467"
-      wrapFirst: true                
-      wtoken: "0xbd833b6ecc30caeabf81db18bb0f1e00c6997e7a"   
-      value:  "max"   
+      wrapFirst: true                  # boleh boolean true (tanpa quotes)
+      wtoken: "0xbd833b6ecc30caeabf81db18bb0f1e00c6997e7a"   # WANKR (kontrak wrap)
+      value:  "max"    # 1 ANKR yang akan di-wrap ke WANKR
       calldata: "0x1679c792000000000000000000000000bd833b6ecc30caeabf81db18bb0f1e00c6997e7a0000000000000000000000009423c6c914857e6daaace3b585f464023150512800000000000000000000000000000000000000000000000000000000000000000000000000000000000000005515d2311d2edb6e24a4dff0c8299cb7a7994f9f00000000000000000000000000000000000000000000000000000199ebde92090000000000000000000000000000000000000000000000000de0b6b3a7640000000000000000000000000000000000000000000000000000000000000000bf5d0000000000000000000000000000000000000000000000000000000000000000"
-      tokenIn:  "0xbd833b6ecc30caeabf81db18bb0f1e00c6997e7a"   
-      tokenOut: "0x9423c6c914857e6daaace3b585f4640231505128"  
+      tokenIn:  "0xbd833b6ecc30caeabf81db18bb0f1e00c6997e7a"   # WANKR (hasil wrap)
+      tokenOut: "0x9423c6c914857e6daaace3b585f4640231505128"   # ztUSD
       times: 5
 
       patches:
@@ -192,6 +220,10 @@ swap:
           to: "$OWNER"
         - mode: auto
           index: 13
+      gas:
+        addPercent: 10
+        limitBumpPercent: 25
+        limitAdd: 30000
 
 
     - name: "ztusd/wankr"
@@ -203,7 +235,7 @@ swap:
       times: 5
       dynamicFixes:
         subIndex: 0
-        amountInFromBalance: true  
+        amountInFromBalance: true   # akan otomatis pakai sisa saldo ztUSD
         minOutWord: 11
         hardcodeMinOut: "0"
       patches:
@@ -212,3 +244,8 @@ swap:
           to: "$OWNER"
         - mode: auto
           index: 13
+
+      gas:
+        addPercent: 10
+        limitBumpPercent: 25
+        limitAdd: 30000
