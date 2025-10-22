@@ -23,22 +23,38 @@ const redactMid = (t, keep=6)=>(!t||typeof t!=='string'||t.length<=keep*2)?t:`${
 const shortAddr = (a)=> a ? (a.slice(0,6)+'…'+a.slice(-4)) : '0x??';
 const fmtLeft = (ms)=>{ if(!ms||ms<=0) return 'expired'; const s=Math.floor(ms/1000); if(s<60)return`${s}s`; const m=Math.floor(s/60); if(m<60)return`${m}m`; const h=Math.floor(m/60); const mm=m%60; return `${h}h${mm?mm+'m':''}`; };
 
+/* === socks5 -> socks5h normalizer (DNS lewat proxy) === */
+function normalizeProxyUrl(u) {
+  if (!u) return u;
+  try {
+    const url = new URL(u);
+    if (url.protocol === 'socks5:') url.protocol = 'socks5h:';
+    return url.toString();
+  } catch {
+    const s = String(u);
+    return s.startsWith('socks5://') ? s.replace(/^socks5:\/\//,'socks5h://') : s;
+  }
+}
+
 function agentFromProxy(proxyUrl){
   if(!proxyUrl) return {httpAgent:undefined,httpsAgent:undefined};
-  const p=String(proxyUrl).trim().toLowerCase();
-  if(p.startsWith('socks')){const a=new SocksProxyAgent(proxyUrl);return{httpAgent:a,httpsAgent:a};}
-  const a=new HttpsProxyAgent(proxyUrl); return {httpAgent:a,httpsAgent:a};
+  const raw = normalizeProxyUrl(proxyUrl);
+  const p=String(raw).trim().toLowerCase();
+  if(p.startsWith('socks')){const a=new SocksProxyAgent(raw);return{httpAgent:a,httpsAgent:a};}
+  const a=new HttpsProxyAgent(raw); return {httpAgent:a,httpsAgent:a};
 }
 function parseProxy(proxyUrl){
   if(!proxyUrl)return{enabled:false};
   try{
-    const u=new URL(proxyUrl);
+    const norm = normalizeProxyUrl(proxyUrl);
+    const u=new URL(norm);
     const kind=(u.protocol||'').replace(':','').toLowerCase();
-    return{enabled:true,kind,host:u.hostname||'',port:u.port||'',user:u.username||'',pass:u.password||'',raw:proxyUrl};
+    return{enabled:true,kind,host:u.hostname||'',port:u.port||'',user:u.username||'',pass:u.password||'',raw:norm};
   }catch{
-    const low=String(proxyUrl).toLowerCase();
-    const kind=low.startsWith('socks')?'socks5':(low.startsWith('https')?'https':(low.startsWith('http')?'http':'proxy'));
-    return{enabled:true,kind,host:proxyUrl,port:'',user:'',pass:'',raw:proxyUrl};
+    const raw = normalizeProxyUrl(String(proxyUrl));
+    const low=raw.toLowerCase();
+    const kind=low.startsWith('socks5h')?'socks5h':(low.startsWith('socks')?'socks5':(low.startsWith('https')?'https':(low.startsWith('http')?'http':'proxy')));
+    return{enabled:true,kind,host:raw,port:'',user:'',pass:'',raw};
   }
 }
 function logSocket(proxyUrl, ui){
@@ -47,8 +63,7 @@ function logSocket(proxyUrl, ui){
   if(!p.enabled){ ui?.session?.('proxy ❗️off❗️'); return; }
   if(level==='off'){ ui?.session?.('proxy ON ✅'); return; }
   if(level==='on'){ ui?.session?.(`✅ Proxy ${(p.kind||'proxy').toUpperCase()} ON ✅`); return; }
-  const auth=(p.user||p.pass)?`${p.user}:${p.pass}@`:'';
-  const hp=`${p.host}${p.port?':'+p.port:''}`;
+  const auth=(p.user||p.pass)?`${p.user}:${p.pass}@`:''; const hp=`${p.host}${p.port?':'+p.port:''}`;
   ui?.session?.(`✅ ${(p.kind||'proxy').toUpperCase()} ${auth}${hp} ✅`);
 }
 
@@ -152,9 +167,9 @@ function compactGeneralLine(s){
   if (/faucet:\s*tidak ada endpoint/i.test(s)) return 'faucet: no endpoint';
   if (/^\[?autoback\]?/i.test(s)) return null;
   if (/useRouter="/i.test(s) || /schedule=/.test(s)) return null;
-  if (/^visit\s+/i.test(s)) return null;
+  // if (/^visit\s+/i.test(s)) return null;
   if (/^▶\s+grouped:/i.test(s)) return null;
-  if (/^•\s+\w+\.run\(\)/.test(s)) return null;
+  if (/^•\s+\w+\.run\(\)/i.test(s)) return null;
   if (/^No claimable tasks\./i.test(s) || /^tasks\s*→/i.test(s)) return null;
   if (/^🪙\s*faucet\.run\(\)/i.test(s) || /^neuraPoints/i.test(s)) return null;
   let m = s.match(/pulse#\s*(\d+).*pulse:collectPulse\(id\).*→\s*200/i); if(m) return `[pulse] #${m[1]} ✅`;
@@ -188,10 +203,10 @@ function makePaneLogger(baseLog, ui, panel, slotTag){
     ...baseLog,
     mini: (...a)=> writeCompact(join(a)),
     info: (...a)=> show && writeCompact(join(a)),
-    warn: (...a)=> writeCompact('⚠️ '+join(a)),
-    error:(...a)=> writeCompact('❌ '+join(a)),
-    api:  (...a)=> (lvl==='debugapi'||lvl==='debugall') && writeCompact(join(a)),
-    all:  (...a)=> (lvl==='debugall') && writeCompact(join(a)),
+    warn:  (...a)=> writeCompact('⚠️ '+join(a)),
+    error: (...a)=> writeCompact('❌ '+join(a)),
+    api:   (...a)=> (lvl==='debugapi'||lvl==='debugall') && writeCompact(join(a)),
+    all:   (...a)=> (lvl==='debugall') && writeCompact(join(a)),
     redactIfNeeded: baseLog.redactIfNeeded
   };
 }
@@ -251,37 +266,167 @@ async function runModulesGrouped(ctx){
   }
 }
 
+/* ================== AUTH LAYER (PATCHED) ================== */
+
+/** Circuit breaker state untuk relogin/hardReauth */
+const authCB = new Map(); // address -> { fails, until }
+function cbGet(a){ return authCB.get(a) || { fails:0, until:0 }; }
+function cbBlock(a){ const s = cbGet(a); return s.until > Date.now(); }
+function cbFail(a){
+  const s = cbGet(a);
+  s.fails = (s.fails||0) + 1;
+  if (s.fails >= Number(get(CFG,'authGuard.maxFails', 3))) {
+    s.until = Date.now() + Number(get(CFG,'authGuard.coolOffMs', 30*60*1000));
+  }
+  authCB.set(a, s);
+}
+function cbOk(a){ authCB.set(a, { fails:0, until:0 }); }
+
+/** 401 interceptor “cerdas”: soft → hard → give up (sekali siklus) */
 function install401Replay(ctx){
+  let inFlight401 = false;
+
   ctx.http.interceptors.response.use(async (res)=>{
     updateSessionFromResponse(res, ctx);
     if (res.status !== 401) return res;
-    ctx.ui.session?.(`401 → relogin · ${shortAddr(ctx.address)}`);
+
+    if (inFlight401) return res; // hindari recursive loop
+    inFlight401 = true;
+
+    // 1) coba soft refresh
     await ensureFreshAuth(ctx, '401');
-    return await ctx.http.request(res.config);
+    if (ctx.session?.bearer) {
+      inFlight401 = false;
+      return await ctx.http.request(res.config);
+    }
+
+    // 2) soft gagal → hard reauth
+    await hardReauth(ctx, '401-hard');
+    inFlight401 = false;
+
+    if (ctx.session?.bearer) {
+      return await ctx.http.request(res.config);
+    } else {
+      // 3) menyerah sementara (biar modul & loop berikutnya yang lanjut)
+      ctx.ui.session?.(`401 persist · give up · ${shortAddr(ctx.address)}`);
+      return res;
+    }
   }, e=>Promise.reject(e));
 }
-async function bootstrapPrivySession(ctx){ ctx.ui.session?.(`bootstrap skip · ${shortAddr(ctx.address)}`); return 204; }
+
+/** Soft refresh (SIWE ringan) */
 async function ensureFreshAuth(ctx, reason=''){
   if (ctx._authLock) return ctx._authLock;
+  if (cbBlock(ctx.address)) {
+    ctx.ui.session?.(`relogin blocked (cooldown) · ${shortAddr(ctx.address)}`);
+    return;
+  }
+
+  const historyMapFile = get(CFG,'auth.historyMapFile','history.json');
+  const historyMapUsed = (fs.existsSync(path.resolve(ROOT, historyMapFile))) ? historyMapFile : null;
+
   ctx._authLock = (async ()=>{
     try{
-      const relog = await siweLogin(ctx.wallet.privateKey, { proxyUrl: ctx.proxy, logLevel: ctx.log.level, socketLevel: 'off' });
+      const relog = await siweLogin(ctx.wallet.privateKey, {
+        proxyUrl: ctx.proxy,
+        logLevel: ctx.log.level,
+        socketLevel: 'off',
+        forceNew: /401|pre-exp|idle-keepalive/i.test(reason) ? true : false,
+        ...(historyMapUsed ? { historyMapFile: historyMapUsed } : {})
+      });
+
       const nb = relog.bearer || relog.data?.identity_token || relog.data?.privy_access_token || relog.data?.token;
-      ctx.session.bearer = nb;
-      ctx.session.cookies = relog.cookies || ctx.session.cookies;
-      ctx.session.expiresAt = parseJwtExp(nb);
+      if (!nb) throw new Error('no bearer from siweLogin');
+
+      ctx.session.bearer   = nb;
+      ctx.session.cookies  = relog.cookies || ctx.session.cookies || [];
+      ctx.session.expiresAt= parseJwtExp(nb);
       ctx.http.defaults.headers.authorization = `Bearer ${nb}`;
       if ((ctx.session.cookies||[]).length) ctx.http.defaults.headers.Cookie = ctx.session.cookies.join('; ');
+
       ctx.stats.reloginOK++; globalStats.reloginOK++;
+      cbOk(ctx.address);
       ctx.ui.session?.(`relogin OK (${reason}) · ${shortAddr(ctx.address)} · in ${fmtLeft(ctx.session.expiresAt - Date.now())}`);
       ctx._persist?.();
+
     }catch(e){
       ctx.stats.reloginFail++; globalStats.reloginFail++;
+      cbFail(ctx.address);
       ctx.ui.session?.(`relogin FAIL · ${shortAddr(ctx.address)} · ${e.message||e}`);
     }
   })().finally(()=>{ ctx._authLock = null; });
+
   return ctx._authLock;
 }
+
+/** Hard reauth: paksa login penuh + rotate proxy + (opsional) solver eksternal */
+async function hardReauth(ctx, reason=''){
+  if (cbBlock(ctx.address)) {
+    ctx.ui.session?.(`hardReauth blocked (cooldown) · ${shortAddr(ctx.address)}`);
+    return;
+  }
+
+  const proxiesRaw = getProxies().map(normalizeProxyUrl);
+  const list = proxiesRaw.length ? proxiesRaw : [ctx.proxy || ''];
+  const maxSwitch = Math.min(Number(get(CFG,'auth.maxProxySwitches', 5)), Math.max(0, list.length-1));
+  let lastErr = null;
+
+  for (let i=0; i<=maxSwitch; i++){
+    const proxy = list[(i) % list.length];
+    logSocket(proxy, ctx.ui);
+
+    try{
+      // bersihkan state lama agar benar2 fresh
+      ctx.session.cookies = [];
+      ctx.session.bearer  = '';
+      ctx.session.expiresAt = 0;
+      ctx.http.defaults.headers.authorization = '';
+      delete ctx.http.defaults.headers.Cookie;
+
+      // OPTIONAL solver captcha/turnstile (sesuaikan kalau kamu punya script)
+      // if (get(CFG,'auth.hard.solveViaNode', false)) {
+      //   await runExternalSolverOnce();
+      // }
+
+      const res = await siweLogin(ctx.wallet.privateKey, {
+        proxyUrl: proxy,
+        logLevel: ctx.log.level,
+        socketLevel: 'off',
+        forceNew: true,
+        freshDevice: true,
+        clearCookies: true,
+      });
+
+      const nb = res.bearer || res.data?.identity_token || res.data?.privy_access_token || res.data?.token;
+      if (!nb) throw new Error('no bearer from hard reauth');
+
+      ctx.session.bearer   = nb;
+      ctx.session.cookies  = res.cookies || [];
+      ctx.session.expiresAt= parseJwtExp(nb);
+      ctx.http.defaults.headers.authorization = `Bearer ${nb}`;
+      if ((ctx.session.cookies||[]).length) ctx.http.defaults.headers.Cookie = ctx.session.cookies.join('; ');
+
+      globalStats.loginOK++; cbOk(ctx.address);
+      ctx.ui.session?.(`hardReauth OK (${reason}) · ${shortAddr(ctx.address)} · proxy#${i+1}`);
+      ctx._persist?.();
+      return;
+
+    }catch(e){
+      lastErr = e;
+      cbFail(ctx.address);
+      ctx.ui.session?.(`hardReauth FAIL · ${shortAddr(ctx.address)} · ${e.message||e}`);
+      if (i < maxSwitch) ctx.ui.session?.('switch proxy → next');
+    }
+  }
+
+  // gagal semua
+  globalStats.loginFail++;
+  ctx.ui.session?.(`hardReauth give up · ${shortAddr(ctx.address)} · last=${lastErr?.message||lastErr}`);
+}
+
+/* ============== end AUTH LAYER (PATCHED) ============== */
+
+async function bootstrapPrivySession(ctx){ ctx.ui.session?.(`bootstrap skip · ${shortAddr(ctx.address)}`); return 204; }
 
 const globalStats = { loginOK:0, loginFail:0, reloginOK:0, reloginFail:0, batchesDone:0, total:0, batchNow:0, batchTotal:0 };
 function sidebarRender(ui){
@@ -294,71 +439,148 @@ function sidebarRender(ui){
   ui.sidebarSet?.(L);
 }
 
+/* ==== LOGIN + ROTASI PROXY ==== */
 let _nextLoginAt = 0;
-async function loginThrottled(pk, proxy, ui) {
-  const minGap = Number(get(CFG,'auth.minGapMs', 9000));
-  const tries  = Math.max(1, Number(get(CFG,'auth.loginTries', 3)));
+
+/** Coba login dengan retry di satu proxy */
+async function tryLoginOnceProxy(pk, proxy, ui, historyArg){
+  const tries  = Math.max(1, Number(get(CFG,'auth.perProxyTries', 2)));
   let   delay  = Number(get(CFG,'auth.rateBaseMs', 4000));
   const back   = Number(get(CFG,'auth.rateBackoff', 1.8));
   const jitter = Number(get(CFG,'auth.rateJitterMs', 500));
 
-  const wait = Math.max(0, _nextLoginAt - Date.now());
-  if (wait>0) ui.session?.(`login throttle ${wait}ms`);
-  if (wait>0) await sleep(wait);
-
   for (let t=1; t<=tries; t++){
     try{
-      const res = await siweLogin(pk, { proxyUrl: proxy, logLevel: get(CFG,'log.level','silent'), socketLevel: get(CFG,'log.socketLevel','off') });
-      _nextLoginAt = Date.now() + minGap;
-      globalStats.loginOK++; sidebarRender(ui);
+      const res = await siweLogin(pk, {
+        proxyUrl: proxy,
+        logLevel: get(CFG,'log.level','silent'),
+        socketLevel: get(CFG,'log.socketLevel','off'),
+        ...historyArg
+      });
       return res;
     }catch(e){
-      if (t<tries && (/429|too[_\s-]*many/i.test(e?.message||'') || /ECONNRESET|ETIMEDOUT|ENETUNREACH|EAI_AGAIN|timeout/i.test(e?.message||''))){
+      const msg = e?.message||'';
+      const transient = /(?:\b401\b|\b403\b|429|too[_\s-]*many|ECONNRESET|ETIMEDOUT|ENETUNREACH|EAI_AGAIN|timeout|before secure TLS connection|siwe\.init\s+401)/i.test(msg);
+      if (t<tries && transient){
         const w = delay + Math.floor(Math.random()*jitter);
-        ui.session?.(`login retry ${t}/${tries} · wait ${w}ms`);
+        ui.session?.(`login retry ${t}/${tries} @proxy → wait ${w}ms`);
         await sleep(w); delay = Math.floor(delay*back); continue;
       }
-      globalStats.loginFail++; sidebarRender(ui);
       throw e;
     }
   }
 }
 
-async function buildAccountCtx({ pk, proxy, baseLog, ui, i }) {
+/** Login throttled + rotasi proxy kalau gagal */
+async function loginThrottledRotate(pk, proxiesList, startIdx, ui) {
+  const minGap = Number(get(CFG,'auth.minGapMs', 9000));
+
+  // history map (opsional)
+  const historyMapFile = get(CFG,'auth.historyMapFile','history.json');
+  const pathAbs = path.resolve(ROOT, historyMapFile);
+  const historyMapExists = fs.existsSync(pathAbs);
+  const historyMap = historyMapExists ? JSON.parse(fs.readFileSync(pathAbs,'utf8')) : null;
+  const historyArg = historyMap ? { historyMap } : (historyMapExists ? { historyMapFile } : {});
+
+  // throttle global
+  const wait = Math.max(0, _nextLoginAt - Date.now());
+  if (wait>0) ui.session?.(`login throttle ${wait}ms`);
+  if (wait>0) await sleep(wait);
+
+  // siapkan daftar proxy yang akan dicoba
+  const envProxy = normalizeProxyUrl(process.env.PROXY || process.env.SOCKS_PROXY || process.env.HTTPS_PROXY || '');
+  const list = (proxiesList && proxiesList.length) ? proxiesList.slice() : (envProxy ? [envProxy] : []);
+  if (!list.length) list.push(''); // kosong = direct
+
+  const maxSwitches = Math.min(
+    Number(get(CFG,'auth.maxProxySwitches', 999)),
+    list.length - 1 >= 0 ? list.length - 1 : 0
+  );
+
+  let lastErr = null;
+  for (let sw = 0; sw <= maxSwitches; sw++){
+    const idx = ( (startIdx||0) + sw ) % list.length;
+    const proxy = list[idx];
+    logSocket(proxy, ui);
+
+    try{
+      const res = await tryLoginOnceProxy(pk, proxy, ui, historyArg);
+      _nextLoginAt = Date.now() + minGap;
+      globalStats.loginOK++; sidebarRender(ui);
+      return { login: res, proxyUsed: proxy };
+    }catch(e){
+      lastErr = e;
+      ui.session?.(`login FAIL @proxy#${idx+1}/${list.length} · ${e.message||e}`);
+      if (sw < maxSwitches) {
+        ui.session?.(`switch proxy → next`);
+      }
+    }
+  }
+
+  globalStats.loginFail++; sidebarRender(ui);
+  throw lastErr || new Error('login failed after proxy rotation');
+}
+
+/* ===== keepAlive helpers ===== */
+async function keepAliveTick(ctx){
+  try{
+    // refresh kalau sisa token < renewSkewMs
+    const skew = Number(get(CFG,'keepAlive.renewSkewMs', 15 * 60 * 1000));
+    const left = (ctx.session.expiresAt || 0) - Date.now();
+    if (skew > 0 && left < skew){
+      await ensureFreshAuth(ctx, 'idle-keepalive');
+      ctx._persist?.();
+    }
+
+    // ping opsional
+    if (get(CFG,'keepAlive.ping.enabled', false)){
+      const url = get(CFG, 'keepAlive.ping.url', ctx.session.origin || process.env.NEURAVERSE_ORIGIN);
+      const r = await ctx.http.get(url, { validateStatus:()=>true });
+      ctx.log.mini(`[ping] ${shortAddr(ctx.address)} → ${r.status}`);
+    }
+  }catch(e){
+    ctx.log.mini(`[ping] fail ${shortAddr(ctx.address)}: ${e.response?.status || e.code || e.message}`);
+  }
+}
+
+async function buildAccountCtx({ pk, proxies, proxyStartIdx, baseLog, ui, i }) {
   const wallet = new ethers.Wallet(pk);
   const { panel, slot } = ui.assignAccount(i, shortAddr(wallet.address));
   const log = makePaneLogger(baseLog, ui, panel, `#${i+1}`);
 
-  let bearer, cookies, login;
+  let bearer, cookies, login, proxyUsed;
   const cached = S.getFor(SDB, wallet.address);
-  const renewSkewMs = Number(get(CFG,'keepAlive.renewSkewMs', 900000));
+  // gunakan renewSkewMs dari config
+  const renewSkewMs = Number(get(CFG,'keepAlive.renewSkewMs', 6 * 60 * 60 * 1000));
 
   if (cached && cached.bearer && Array.isArray(cached.cookies)) {
     const left = (cached.expiresAt || 0) - Date.now();
     if (left > renewSkewMs) {
-      bearer  = cached.bearer; cookies = cached.cookies; login = { address: wallet.address };
+      bearer  = cached.bearer; cookies = cached.cookies; login = { address: wallet.address }; proxyUsed = proxies?.[proxyStartIdx] || (process.env.PROXY || process.env.SOCKS_PROXY || process.env.HTTPS_PROXY || '');
       ui.session?.(`INIT reuse · ${shortAddr(wallet.address)} · expires in ${fmtLeft(left)}`);
     } else {
       ui.session?.(`INIT cached near-exp (${fmtLeft(left)}) → relogin · ${shortAddr(wallet.address)}`);
-      login = await loginThrottled(pk, proxy, ui);
+      const out = await loginThrottledRotate(pk, proxies, proxyStartIdx, ui);
+      login = out.login; proxyUsed = out.proxyUsed;
       ui.session?.(`login OK · ${shortAddr(wallet.address)} · cookies=${(login.cookies||[]).length}`);
       bearer  = login.bearer || login.data?.identity_token || login.data?.privy_access_token || login.data?.token;
       cookies = login.cookies || [];
     }
   } else {
     ui.session?.(`INIT need-login · ${shortAddr(wallet.address)}`);
-    login = await loginThrottled(pk, proxy, ui);
+    const out = await loginThrottledRotate(pk, proxies, proxyStartIdx, ui);
+    login = out.login; proxyUsed = out.proxyUsed;
     ui.session?.(`login OK · ${shortAddr(wallet.address)} · cookies=${(login.cookies||[]).length}`);
     bearer  = login.bearer || login.data?.identity_token || login.data?.privy_access_token || login.data?.token;
     cookies = login.cookies || [];
   }
 
   const origin  = process.env.NEURAVERSE_ORIGIN || 'https://neuraverse.neuraprotocol.io';
-  const http    = httpWithSession({ bearer, cookies, origin, proxy });
+  const http    = httpWithSession({ bearer, cookies, origin, proxy: proxyUsed });
 
   const ctx = {
     address: (login?.address) || wallet.address,
-    wallet, http, env: process.env, config: CFG, api: API, proxy, log, ui,
+    wallet, http, env: process.env, config: CFG, api: API, proxy: proxyUsed, log, ui,
     stats: { reloginOK:0, reloginFail:0 },
     session: { bearer, cookies, origin, expiresAt: bearer ? parseJwtExp(bearer) : 0 },
     _authLock:null,
@@ -370,7 +592,8 @@ async function buildAccountCtx({ pk, proxy, baseLog, ui, i }) {
   await bootstrapPrivySession(ctx);
   ctx._persist();
 
-  const renewSkew = Number(get(CFG,'keepAlive.renewSkewMs', 900000));
+  // Scheduler per-akun untuk early renew (tetap ada)
+  const renewSkew = Number(get(CFG,'keepAlive.renewSkewMs', 15 * 60 * 1000));
   const checkMs   = Number(get(CFG,'authGuard.checkMs', 120000));
   const jitter    = Number(get(CFG,'authGuard.jitterMs', 15000));
   setTimeout(async function loop(){
@@ -438,19 +661,20 @@ function startSessionTicker(allCtx, ui){
 
 (async ()=>{
   try{
-    const keys = getPrivateKeys();
-    const proxies = getProxies();
+    const keysRaw = getPrivateKeys();
+    const proxiesRaw = getProxies();
+    const proxies = proxiesRaw.map(normalizeProxyUrl);
     const baseLog = makeLogger();
     const ui = makeUI(CFG);
     if (ui._initPromise) await ui._initPromise;
 
     installNoiseMuter(ui);
 
-    globalStats.total = keys.length;
-    ui.session?.(`🔑 total akun: ${keys.length} | log.level=${baseLog.level}`);
+    globalStats.total = keysRaw.length;
+    ui.session?.(`🔑 total akun: ${keysRaw.length} | log.level=${baseLog.level}`);
     let batchSize = Number(get(CFG,'flow.loginBatchSize', get(CFG,'flow.perAccountMax', 3)));
     if (!batchSize || batchSize<1) batchSize = 3;
-    globalStats.batchTotal = Math.ceil(keys.length / batchSize);
+    globalStats.batchTotal = Math.ceil(keysRaw.length / batchSize);
     let batchIdx = 0;
     const contextsAll = [];
 
@@ -459,19 +683,23 @@ function startSessionTicker(allCtx, ui){
     const haveMultiProxy = proxies.length > 1;
     const limitLogin = pLimit(haveMultiProxy ? loginConc : 1);
 
-    for (let start=0; start<keys.length; start += batchSize) {
-      const end = Math.min(keys.length, start + batchSize);
+    for (let start=0; start<keysRaw.length; start += batchSize) {
+      const end = Math.min(keysRaw.length, start + batchSize);
       batchIdx++; globalStats.batchNow = batchIdx; sidebarRender(ui);
       ui.session?.(`📦 Batch ${batchIdx}/${globalStats.batchTotal}: akun ${start+1}..${end}`);
 
-      const results = await Promise.all(keys.slice(start, end).map((pk, idx)=>{
+      const results = await Promise.all(keysRaw.slice(start, end).map((pk, idx)=>{
         const i = start + idx;
-        const proxy = proxies.length ? proxies[i % proxies.length] : (process.env.PROXY || process.env.SOCKS_PROXY || process.env.HTTPS_PROXY || '');
+        const startIdx = proxies.length ? (i % proxies.length) : 0;
         return limitLogin(async ()=>{
           if (loginStagger>0){ const jitter = Math.floor(Math.random()*loginStagger); await sleep(loginStagger + jitter); }
-          logSocket(proxy, ui);
-          try { const ctx = await buildAccountCtx({ pk, proxy, baseLog, ui, i }); return {ok:true, ctx}; }
-          catch (e) { ui.session?.(`login FAIL · ${shortAddr(new ethers.Wallet(pk).address)} · ${e.message||e}`); return {ok:false}; }
+          try {
+            const ctx = await buildAccountCtx({ pk, proxies, proxyStartIdx:startIdx, baseLog, ui, i });
+            return {ok:true, ctx};
+          } catch (e) {
+            ui.session?.(`login FAIL · ${shortAddr(new ethers.Wallet(pk).address)} · ${e.message||e}`);
+            return {ok:false};
+          }
         });
       }));
 
@@ -480,7 +708,7 @@ function startSessionTicker(allCtx, ui){
       globalStats.batchesDone++; sidebarRender(ui);
 
       const between = Number(get(CFG,'flow.betweenBatchesMs', 4000));
-      if (between>0 && end<keys.length) { ui.session?.(`[batch] jeda ${between}ms`); await sleep(between); }
+      if (between>0 && end<keysRaw.length) { ui.session?.(`[batch] jeda ${between}ms`); await sleep(between); }
     }
 
     const aft = (CFG.flow && CFG.flow.afterAll) || {};
@@ -498,9 +726,35 @@ function startSessionTicker(allCtx, ui){
 
     if (contextsAll.length && !get(CFG,'ui.disableTicker', false)){ startSessionTicker(contextsAll, ui); }
 
-    const IDLE_MS = Number(get(CFG,'flow.idleMs', 300000));
-    const REPEAT  = get(CFG,'flow.repeatRounds', true);
-    while (REPEAT){ await runRound(contextsAll, makeLogger()); ui.session?.(`[idle] ${IDLE_MS}ms`); await sleep(IDLE_MS); }
+    // ====== IDLE / KEEP-ALIVE LOOP (baru) ======
+    const IDLE_MS_DEFAULT = Number(get(CFG,'flow.idleMs', 300000));
+    const KA_idleOnly = Boolean(get(CFG,'keepAlive.idleOnly', false));
+    const KA_hours    = Number(get(CFG,'keepAlive.hours', 0));
+    const KA_sleepMs  = Number(get(CFG,'keepAlive.sleepMs', IDLE_MS_DEFAULT));
+    const KA_endAt    = KA_idleOnly && KA_hours>0 ? (Date.now() + KA_hours*60*60*1000) : 0;
+    const REPEAT      = get(CFG,'flow.repeatRounds', true);
+
+    while (REPEAT){
+      if (!KA_idleOnly){
+        // mode normal: jalankan modul tiap putaran
+        await runRound(contextsAll, makeLogger());
+      } else {
+        // mode idleOnly: tidak jalankan modul, hanya jaga sesi
+        if (KA_endAt && Date.now() > KA_endAt){
+          ui.session?.(`keepAlive done (≈${KA_hours}h)`);
+          break;
+        }
+      }
+
+      // ping/refresh per akun saat idle
+      if (KA_idleOnly || get(CFG,'keepAlive.ping.enabled', false)){
+        await Promise.all(contextsAll.map(keepAliveTick));
+      }
+
+      const SLEEP = KA_sleepMs>0 ? KA_sleepMs : IDLE_MS_DEFAULT;
+      ui.session?.(`[idle] ${SLEEP}ms`);
+      await sleep(SLEEP);
+    }
   }catch(e){
     console.error('[fatal]', e.response?.status || '', e.response?.data ?? e.stack ?? e.message);
   }
