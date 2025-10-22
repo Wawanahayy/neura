@@ -20,7 +20,7 @@ auth:
   rateBaseMs: 4000
   rateBackoff: 1.8
   rateJitterMs: 500
-  loginStaggerMs: 1000      # jeda antar login (ms)
+  loginStaggerMs: 100      # jeda antar login (ms)
   loginConcurrency: 5
 keepAlive:
   renewSkewMs: 900000
