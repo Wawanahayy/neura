@@ -1,92 +1,108 @@
-#!/usr/bin/env node
-// faucet.mjs 
-
+// faucet.mjs — robust faucet caller (prefer appBase → fallback), payload & 404-aware
 import { ethers } from 'ethers';
 
-const sleep = (ms)=> new Promise(r=>setTimeout(r,ms));
-
-function join(base, p){
-  const b = String(base||'').replace(/\/+$/,'');
-  const s = String(p||'').replace(/^\/+/,'');
-  return b + '/' + s;
-}
-function uniq(arr){ const s=new Set(); const out=[]; for(const x of arr){ if(!x) continue; const k=String(x); if(s.has(k)) continue; s.add(k); out.push(x);} return out; }
-
-function buildCandidateUrls(api){
-  const app   = api?.endpoints?.appBase;
-  const infra = api?.endpoints?.infraBase;
-  const urls  = [];
-  if (app)   urls.push(join(app,   '/api/faucet')); // match successful curl
-  if (infra) urls.push(join(infra, '/api/faucet')); // fallback only
-  return uniq(urls);
-}
+function toLowerObjKeys(o){ const r={}; for(const k of Object.keys(o||{})) r[k.toLowerCase()]=o[k]; return r; }
+const uniq = (arr)=> Array.from(new Set(arr.filter(Boolean)));
+const is2xx = (s)=> s>=200 && s<300;
 
 export async function run(ctx){
   const { http, api, config, log, address } = ctx;
   log.mini('🪙 faucet.run() start');
 
+  const endpoints = api?.endpoints || {};
+  const infraBase = String(endpoints.infraBase || '').replace(/\/+$/,'');
+  const appBase   = String(endpoints.appBase   || '').replace(/\/+$/,'');
+  const accountPath = endpoints.accountPath || '/api/account';
+  const claimPaths  = Array.isArray(endpoints.claimPaths) && endpoints.claimPaths.length
+    ? endpoints.claimPaths
+    : ['/api/faucet'];
+
+  // ---------- (opsional) cek poin dari /account di infra ----------
+  let pts = null;
   try {
-    const accUrl = join(api?.endpoints?.infraBase, api?.endpoints?.accountPath || '/api/account');
-    const r = await http.get(accUrl);
-    const d = r?.data || {};
-    const pts = Number(d.neuraPoints ?? d.neurapoints ?? d.points ?? NaN);
-    const min = Number(config?.claim?.minPoints ?? 0);
-    if (config?.claim?.skipIfBelowPoints && Number.isFinite(pts)) {
-      log.mini(`neuraPoints = ${pts}; min = ${min}`);
-      if (pts < min){ log.mini(' ⏭️  skip faucet (points < minPoints)'); return; }
+    if (infraBase) {
+      const r = await http.get(infraBase + accountPath);
+      const acc = toLowerObjKeys(r.data||{});
+      pts = Number(acc.points ?? acc.neurapoints ?? acc.neurapoints ?? acc.neurapoints ?? NaN);
     }
-  } catch {/* ignore */}
-
-  const urls = buildCandidateUrls(api);
-  const csAddr = ethers.getAddress(address);
-
-  const maxAttemptsPerUrl = Math.max(1, Number(config?.claim?.maxAttempts ?? 3));
-  const backoffBaseMs     = Math.max(0, Number(config?.claim?.retryBaseMs ?? 600)); // small backoff to calm CF
-  const jitterMs          = Math.max(0, Number(config?.claim?.retryJitterMs ?? 200));
-
-  const body = { address: csAddr, userLoggedIn: true, chainId: 11155111 }; // EXACT like curl
-
-  for (const url of urls){
-    const path = new URL(url).pathname;
-
-    let ok = false;
-    for (let attempt=1; attempt<=maxAttemptsPerUrl; attempt++){
-      try{
-        const r = await http.post(url, body, { headers: { 'content-type':'application/json' } });
-        const msg = (r?.data?.message || r?.data?.status || '').toString();
-        if (r.status === 200) {
-          log.mini(`🎉 faucet OK via ${path} (try ${attempt}/${maxAttemptsPerUrl}) — ${msg || 'ok'}`);
-          ok = true;
-          break;
-        }
-
-        if (r.status === 404) { 
-          log.mini(`→ POST ${path} 404 (skip URL)`);
-          break;
-        }
-
-        const reason = msg || (r?.data?.error || '').toString();
-        log.mini(`→ POST ${path} ${r.status}${reason?` "${reason}"`:''} (try ${attempt}/${maxAttemptsPerUrl})`);
-
-        if (r.status === 403 && /suspicious|forbidden|blocked/i.test(reason || '')) {
-          log.mini(` ⛔️ stop retries for ${path} due to 403 anti-abuse`);
-          break;
-        }
-
-      } catch(e){
-        log.mini(`→ POST ${path} x ${e?.code || e?.message} (try ${attempt}/${maxAttemptsPerUrl})`);
-      }
-
-      if (attempt < maxAttemptsPerUrl){
-        const wait = Math.floor(backoffBaseMs * Math.pow(1.5, attempt-1) + Math.random()*jitterMs);
-        if (wait > 0) await sleep(wait);
-      }
-    }
-
-    if (ok) return; 
+  } catch {}
+  const min = Number(config?.claim?.minPoints ?? 0);
+  if (config?.claim?.skipIfBelowPoints && Number.isFinite(pts)) {
+    log.mini(`neuraPoints = ${pts}; min = ${min}`);
+    if (pts < min){ log.mini(' ⏭️    skip faucet (points < minPoints)'); return; }
   }
 
-  log.mini('faucet: tidak ada endpoint yang berhasil (stopped after limited attempts)');
+  // ---------- susun kandidat URL (prioritas appBase lebih dulu untuk faucet) ----------
+  // urutan: appBase+p → infraBase+p, per path
+  const urlCandidates = claimPaths.flatMap(p => uniq([
+    appBase   && (appBase + p),
+    infraBase && (infraBase + p),
+  ])).filter(Boolean);
+
+  // ---------- susun variasi body ----------
+  // pake setting dari api.claimBodies kalau ada; kalau tidak, fallback aman
+  const configuredBodies = Array.isArray(api?.claimBodies) ? api.claimBodies : [];
+  const fallbackBodies = [
+    { address },
+    { recipient: address },
+    { to: address },
+    {}, // beberapa endpoint cukup rely on session
+  ];
+  const bodies = (configuredBodies.length ? configuredBodies : fallbackBodies)
+    .map(b => JSON.parse(JSON.stringify(b).replace(/\$ADDRESS/g, address)));
+
+  // ---------- helper deteksi sukses ----------
+  const looksSuccess = (data) => {
+    try {
+      if (!data) return false;
+      const s = typeof data === 'string' ? data : JSON.stringify(data);
+      if (data.status === 'success') return true;
+      return /distribution successful|airdrop tokens/i.test(s);
+    } catch { return false; }
+  };
+  const shortReason = (d) => {
+    try {
+      return (d?.message || d?.error || (typeof d === 'string' ? d : ''))?.toString().slice(0,200);
+    } catch { return ''; }
+  };
+
+  // ---------- eksekusi ----------
+  for (const url of urlCandidates){
+    const pathname = (()=>{ try { return new URL(url).pathname; } catch { return url; }})();
+    for (const body of bodies){
+      try {
+        const r = await http.post(url, body);
+        if (is2xx(r.status)) {
+          if (looksSuccess(r.data)) {
+            const msg = (r.data && (r.data.message || r.data.status || 'ok'));
+            log.mini(`🎉 faucet OK${msg?` — ${msg}`:''}`);
+            return;
+          }
+          // 2xx tapi belum yakin sukses → lanjut coba payload lain
+          log.mini(`→ POST ${pathname} ${r.status} (unexpected success payload)`);
+          continue;
+        }
+
+        // 404 sering terjadi di INFRA untuk /api/faucet → jangan buang waktu dengan payload lain pada URL ini
+        if (r.status === 404) {
+          log.mini(`→ POST ${pathname} 404 — skip URL ini, coba endpoint lain`);
+          break; // pindah ke URL berikutnya
+        }
+
+        // tampilkan reason singkat lalu coba payload berikutnya
+        const reason = shortReason(r.data);
+        log.mini(`→ POST ${pathname} ${r.status}${reason?` "${reason}"`:''}`);
+      } catch (e) {
+        const code = e?.code || e?.name || '';
+        const msg  = (e?.response?.data && shortReason(e.response.data)) || e?.message || '';
+        log.mini(`→ POST ${pathname} x ${code}${msg?` "${msg}"`:''}`);
+        // network/TLS error → lanjut coba payload lain atau URL lain
+        continue;
+      }
+    }
+  }
+
+  log.mini('faucet: tidak ada endpoint yang berhasil');
 }
 
 export default { run };
